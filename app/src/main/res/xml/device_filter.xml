@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Canon vendor id 0x04A9 = 1193 -->
+    <usb-device vendor-id="1193" />
+</resources>
