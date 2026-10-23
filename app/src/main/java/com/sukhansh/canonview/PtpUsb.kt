@@ -49,7 +49,7 @@ class PtpUsb(
         val len = hdr.int.toLong() and 0xFFFFFFFFL
         val type = hdr.short.toInt() and 0xFFFF
         val code = hdr.short.toInt() and 0xFFFF
-        if (len < 12 || len > 64L * 1024 * 1024) throw PtpException("bad container length $len")
+        if (len < 12 || len > (64L * 1024 * 1024)) throw PtpException("bad container length $len")
         fill(len.toInt(), timeoutMs)
         val payload = rx.copyOfRange(12, len.toInt())
         rx = rx.copyOfRange(len.toInt(), rx.size)
@@ -66,7 +66,7 @@ class PtpUsb(
         val p = ByteBuffer.allocate(params.size * 4).order(ByteOrder.LITTLE_ENDIAN)
         params.forEach { p.putInt(it) }
         write(container(1, opcode, p.array()), timeoutMs)
-        if (dataOut != null) write(container(2, opcode, dataOut), timeoutMs)
+        dataOut?.let { write(container(2, opcode, it), timeoutMs) }
 
         var data: ByteArray? = null
         while (true) {
