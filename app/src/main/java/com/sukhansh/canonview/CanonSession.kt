@@ -200,41 +200,70 @@ class CanonSession(private val ptp: PtpUsb) {
                         err = "Camera/lens is in manual focus: set the lens switch to AF"
                         dbg("AF requested while in MF mode")
                     } else {
+                        // 2. Clear any stuck AF first
+                        val c1 = ptp.transact(0x9160)
+                        dbg("AF clear stuck AfCancel code=0x${c1.code.toString(16)}")
+                        pollEvents()
+                        Thread.sleep(300)
+                        pollEvents()
+
+                        // 3. ZoomPosition
                         val z = ptp.transact(OC_EOS_ZOOM_POSITION, intArrayOf(a.x, a.y))
                         dbg("AF ZoomPosition x=${a.x} y=${a.y} code=0x${z.code.toString(16)}")
+                        Thread.sleep(150)
+                        pollEvents()
 
-                        var f = ptp.transact(OC_EOS_DO_AF, timeoutMs = 8000)
+                        // 4. DoAf
+                        var f = ptp.transact(OC_EOS_DO_AF)
                         var afTries = 0
                         while (f.code == RC_DEVICE_BUSY && afTries < 5) {
-                            Thread.sleep(200)
+                            Thread.sleep(300)
                             pollEvents()
-                            f = ptp.transact(OC_EOS_DO_AF, timeoutMs = 8000)
+                            f = ptp.transact(OC_EOS_DO_AF)
                             afTries++
                         }
                         dbg("AF DoAf code=0x${f.code.toString(16)} (tries=$afTries)")
 
                         var halfCode = RC_OK
                         if (f.code != RC_OK) {
-                            val halfRes = ptp.transact(OC_EOS_REMOTE_RELEASE_ON, intArrayOf(1, 0), timeoutMs = 3000)
-                            halfCode = halfRes.code
-                            var hTries = 0
-                            while (hTries < 30) {
-                                pollEvents()
+                            // 5. Mirror-down AF fallback
+                            dbg("DoAf failed (0x${f.code.toString(16)}), starting mirror-down AF fallback...")
+                            val rEvfOff = setProp(PROP_EVF_OUTPUT_DEVICE, 0)
+                            dbg("AF mirror-down EVF off res=0x${rEvfOff.code.toString(16)}")
+                            repeat(7) {
                                 Thread.sleep(100)
-                                hTries++
+                                pollEvents()
                             }
-                            ptp.transact(OC_EOS_REMOTE_RELEASE_OFF, intArrayOf(1))
-                            dbg("AF half-press fallback code=0x${halfCode.toString(16)}")
+
+                            val halfRes = ptp.transact(OC_EOS_REMOTE_RELEASE_ON, intArrayOf(1, 0))
+                            halfCode = halfRes.code
+                            dbg("AF mirror-down half-press code=0x${halfCode.toString(16)}")
+                            repeat(25) {
+                                Thread.sleep(100)
+                                pollEvents()
+                            }
+
+                            val rOff = ptp.transact(OC_EOS_REMOTE_RELEASE_OFF, intArrayOf(1))
+                            val rCancel = ptp.transact(0x9160) // AfCancel
+                            dbg("AF mirror-down releaseOff=0x${rOff.code.toString(16)} afCancel=0x${rCancel.code.toString(16)}")
+                            pollEvents()
+
+                            val rEvf1 = setPropRetry(PROP_EVF_MODE, 1)
+                            val rEvf2 = setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
+                            dbg("AF mirror-down EVF restore mode=0x${rEvf1.code.toString(16)} dev=0x${rEvf2.code.toString(16)}")
+                        } else {
+                            // 6. After successful DoAf
+                            repeat(15) {
+                                Thread.sleep(100)
+                                pollEvents()
+                            }
+                            val c2 = ptp.transact(0x9160) // AfCancel
+                            dbg("AF post-success AfCancel code=0x${c2.code.toString(16)}")
+                            pollEvents()
                         }
 
-                        val cancelRes = ptp.transact(0x9160) // AfCancel
-                        dbg("AF AfCancel code=0x${cancelRes.code.toString(16)}")
-                        pollEvents()
-                        setPropRetry(PROP_EVF_MODE, 1)
-                        setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
-
                         if (f.code != RC_OK && halfCode != RC_OK) {
-                            err = "AF failed: zoomPos=0x${z.code.toString(16)} doAf=0x${f.code.toString(16)} half=0x${halfCode.toString(16)}"
+                            err = "AF failed: afCancel=0x${c1.code.toString(16)} zoomPos=0x${z.code.toString(16)} doAf=0x${f.code.toString(16)} half=0x${halfCode.toString(16)}"
                         }
                     }
                 }
