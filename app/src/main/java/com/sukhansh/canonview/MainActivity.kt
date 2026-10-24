@@ -504,24 +504,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun showBracketDialog(s: CanonSession) {
         val optionsText = arrayOf(
-            "3 x 1/3 EV",
-            "3 x 2/3 EV",
-            "3 x 1 EV",
-            "5 x 1/3 EV",
-            "5 x 2/3 EV",
-            "5 x 1 EV",
-            "7 x 2/3 EV",
-            "5 x 2 EV"
+            "3 x 1/3 EV (-1/3, 0, +1/3)",
+            "3 x 2/3 EV (-2/3, 0, +2/3)",
+            "3 x 1 EV (-1, 0, +1)",
+            "3 x 2 EV (-2, 0, +2)",
+            "5 x 1/3 EV (-2/3 .. +2/3)",
+            "5 x 2/3 EV (-1 1/3 .. +1 1/3)",
+            "5 x 1 EV (-2 .. +2)",
+            "5 x 2 EV (-4 .. +4)",
+            "7 x 1/3 EV (-1 .. +1)",
+            "7 x 2/3 EV (-2 .. +2)",
+            "7 x 1 EV (-3 .. +3)"
         )
         val params = arrayOf(
             3 to 1,
             3 to 2,
             3 to 3,
+            3 to 6,
             5 to 1,
             5 to 2,
             5 to 3,
+            5 to 6,
+            7 to 1,
             7 to 2,
-            5 to 6
+            7 to 3
         )
 
         AlertDialog.Builder(this)
