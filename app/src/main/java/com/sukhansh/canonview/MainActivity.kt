@@ -61,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     // Photo Preview Overlay
     private lateinit var previewCard: FrameLayout
     private lateinit var previewImage: ImageView
+    private var autoHidePreviewRunnable: Runnable? = null
 
     // Debug Log Overlay
     private lateinit var logOverlay: TextView
@@ -365,12 +366,14 @@ class MainActivity : AppCompatActivity() {
         previewImage = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
         val dismissBtn = Button(this).apply {
             text = "CLOSE"
-            setOnClickListener { previewCard.visibility = View.GONE }
+            setOnClickListener {
+                autoHidePreviewRunnable?.let { mainHandler.removeCallbacks(it) }
+                previewCard.visibility = View.GONE
+            }
         }
-        val previewWidthPx = (180 * density).toInt()
-        val previewHeightPx = (135 * density).toInt()
-        val previewTopMarginPx = (20 * density).toInt()
-        val previewMarginEndPx = (16 * density).toInt()
+        val previewWidthPx = (240 * density).toInt()
+        val previewHeightPx = (180 * density).toInt()
+        val previewMarginStartPx = (16 * density).toInt()
 
         previewCard = FrameLayout(this).apply {
             setBackgroundColor(0xEE000000.toInt())
@@ -390,9 +393,8 @@ class MainActivity : AppCompatActivity() {
             })
             addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
             addView(sideScroll, sideScrollParams)
-            addView(previewCard, FrameLayout.LayoutParams(previewWidthPx, previewHeightPx, Gravity.TOP or Gravity.END).apply {
-                topMargin = previewTopMarginPx
-                marginEnd = previewMarginEndPx
+            addView(previewCard, FrameLayout.LayoutParams(previewWidthPx, previewHeightPx, Gravity.START or Gravity.CENTER_VERTICAL).apply {
+                marginStart = previewMarginStartPx
             })
         }
 
@@ -627,6 +629,13 @@ class MainActivity : AppCompatActivity() {
                         runOnUiThread {
                             previewImage.setImageBitmap(shotBmp)
                             previewCard.visibility = View.VISIBLE
+
+                            autoHidePreviewRunnable?.let { mainHandler.removeCallbacks(it) }
+                            val runnable = Runnable {
+                                previewCard.visibility = View.GONE
+                            }
+                            autoHidePreviewRunnable = runnable
+                            mainHandler.postDelayed(runnable, 6000L)
                         }
                     }
                 }
