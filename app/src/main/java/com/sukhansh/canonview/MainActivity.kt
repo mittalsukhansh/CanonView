@@ -36,7 +36,6 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.core.graphics.get
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -616,39 +615,73 @@ class MainActivity : AppCompatActivity() {
 
     /** Brightness stats and focus peaking edge points from live view picture. */
     private fun analyze(bmp: Bitmap): Triple<Float, IntArray, FloatArray?> {
+        val width = bmp.width
+        val height = bmp.height
+        val totalPixels = width * height
+        val pixels = IntArray(totalPixels)
+        bmp.getPixels(pixels, 0, width, 0, 0, width, height)
+
         val hist = IntArray(64)
         var sumLin = 0.0
         var n = 0
-        val step = 8
-        val edgePoints = ArrayList<Float>()
+
+        // Histogram and exposure sampling step
+        val histStep = 8
         var y = 1
-        while (y < bmp.height - 1) {
+        while (y < height - 1) {
             var x = 1
-            while (x < bmp.width - 1) {
-                val c = bmp[x, y]
-                val l = 0.2126 * ((c shr 16) and 255) + 0.7152 * ((c shr 8) and 255) + 0.0722 * (c and 255)
-                hist[(l / 4).toInt().coerceAtMost(63)]++
+            while (x < width - 1) {
+                val c = pixels[y * width + x]
+                val r = (c shr 16) and 255
+                val g = (c shr 8) and 255
+                val b = c and 255
+                val l = (r * 54 + g * 183 + b * 19) shr 8
+
+                hist[(l / 4).coerceAtMost(63)]++
                 sumLin += (l / 255.0).pow(2.2)
                 n++
-
-                if (hud.enableFocusPeaking) {
-                    val cRight = bmp[x + 1, y]
-                    val lRight = 0.2126 * ((cRight shr 16) and 255) + 0.7152 * ((cRight shr 8) and 255) + 0.0722 * (cRight and 255)
-                    val cDown = bmp[x, y + 1]
-                    val lDown = 0.2126 * ((cDown shr 16) and 255) + 0.7152 * ((cDown shr 8) and 255) + 0.0722 * (cDown and 255)
-                    val diff = abs(l - lRight) + abs(l - lDown)
-                    if (diff > 45) {
-                        edgePoints.add(x.toFloat())
-                        edgePoints.add(y.toFloat())
-                    }
-                }
-                x += step
+                x += histStep
             }
-            y += step
+            y += histStep
         }
-        val mean = (sumLin / n).coerceAtLeast(1e-6)
+
+        // Advanced High-Resolution Focus Peaking with Sobel Luminance Gradient
+        val edgePoints = if (hud.enableFocusPeaking) ArrayList<Float>() else null
+        if (hud.enableFocusPeaking) {
+            val peakStep = 2
+            val threshold = 36
+            var py = 1
+            while (py < height - 1) {
+                var px = 1
+                while (px < width - 1) {
+                    val idx = py * width + px
+                    val cL = pixels[idx - 1]
+                    val cR = pixels[idx + 1]
+                    val cU = pixels[idx - width]
+                    val cD = pixels[idx + width]
+
+                    val lL = (((cL shr 16) and 255) * 54 + ((cL shr 8) and 255) * 183 + (cL and 255) * 19) shr 8
+                    val lR = (((cR shr 16) and 255) * 54 + ((cR shr 8) and 255) * 183 + (cR and 255) * 19) shr 8
+                    val lU = (((cU shr 16) and 255) * 54 + ((cU shr 8) and 255) * 183 + (cU and 255) * 19) shr 8
+                    val lD = (((cD shr 16) and 255) * 54 + ((cD shr 8) and 255) * 183 + (cD and 255) * 19) shr 8
+
+                    val dx = abs(lR - lL)
+                    val dy = abs(lD - lU)
+                    val grad = dx + dy
+
+                    if (grad > threshold) {
+                        edgePoints?.add(px.toFloat())
+                        edgePoints?.add(py.toFloat())
+                    }
+                    px += peakStep
+                }
+                py += peakStep
+            }
+        }
+
+        val mean = (sumLin / n.coerceAtLeast(1)).coerceAtLeast(1e-6)
         val ev = log2(mean / 0.18).toFloat().coerceIn(-3f, 3f)
-        val ptsArray = if (edgePoints.isNotEmpty()) edgePoints.toFloatArray() else null
+        val ptsArray = if (edgePoints != null && edgePoints.isNotEmpty()) edgePoints.toFloatArray() else null
         return Triple(ev, hist, ptsArray)
     }
 
