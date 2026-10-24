@@ -35,6 +35,10 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.get
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlin.math.abs
 import kotlin.math.log2
 import kotlin.math.pow
@@ -80,11 +84,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun applyImmersiveMode() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.attributes.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            @Suppress("DEPRECATION")
+            window.attributes.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            applyImmersiveMode()
+        }
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyImmersiveMode()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         usb = getSystemService(USB_SERVICE) as UsbManager
+
+        val density = resources.displayMetrics.density
 
         image = ImageView(this).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
@@ -93,7 +123,7 @@ class MainActivity : AppCompatActivity() {
         hud = HudView(this)
         status = TextView(this).apply {
             setTextColor(Color.WHITE)
-            setPadding(24, 16, 24, 16)
+            setPadding((12 * density).toInt(), (8 * density).toInt(), (12 * density).toInt(), (8 * density).toInt())
         }
 
         buttons = Settings.all.associateWith { p ->
@@ -279,8 +309,35 @@ class MainActivity : AppCompatActivity() {
             addView(nearFarBar)
         }
 
+        val sideWidthPx = (130 * density).toInt()
+        val sideMarginEndPx = (12 * density).toInt()
+        val sideTopMarginPx = (32 * density).toInt()
+        val fallbackBottomMarginPx = (64 * density).toInt()
+
+        val sideScrollParams = FrameLayout.LayoutParams(
+            sideWidthPx,
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            Gravity.END
+        ).apply {
+            topMargin = sideTopMarginPx
+            bottomMargin = fallbackBottomMarginPx
+            marginEnd = sideMarginEndPx
+        }
+
         val sideScroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
             addView(side)
+        }
+
+        bar.post {
+            val barHeight = bar.height
+            if (barHeight > 0) {
+                val params = sideScroll.layoutParams as? FrameLayout.LayoutParams
+                if (params != null) {
+                    params.bottomMargin = barHeight
+                    sideScroll.layoutParams = params
+                }
+            }
         }
 
         // --- Photo Preview Overlay ---
@@ -289,27 +346,42 @@ class MainActivity : AppCompatActivity() {
             text = "CLOSE"
             setOnClickListener { previewCard.visibility = View.GONE }
         }
+        val previewWidthPx = (180 * density).toInt()
+        val previewHeightPx = (135 * density).toInt()
+        val previewTopMarginPx = (20 * density).toInt()
+        val previewMarginEndPx = (16 * density).toInt()
+
         previewCard = FrameLayout(this).apply {
             setBackgroundColor(0xEE000000.toInt())
             visibility = View.GONE
-            setPadding(16, 16, 16, 16)
+            setPadding((8 * density).toInt(), (8 * density).toInt(), (8 * density).toInt(), (8 * density).toInt())
             addView(previewImage, FrameLayout.LayoutParams(-1, -1))
             addView(dismissBtn, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
         }
 
-        setContentView(FrameLayout(this).apply {
+        val rootLayout = FrameLayout(this).apply {
             addView(image, FrameLayout.LayoutParams(-1, -1))
             addView(hud, FrameLayout.LayoutParams(-1, -1))
             addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
             addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
-            addView(sideScroll, FrameLayout.LayoutParams(320, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply {
-                marginEnd = 24
+            addView(sideScroll, sideScrollParams)
+            addView(previewCard, FrameLayout.LayoutParams(previewWidthPx, previewHeightPx, Gravity.TOP or Gravity.END).apply {
+                topMargin = previewTopMarginPx
+                marginEnd = previewMarginEndPx
             })
-            addView(previewCard, FrameLayout.LayoutParams(400, 300, Gravity.TOP or Gravity.END).apply {
-                topMargin = 40
-                marginEnd = 40
-            })
-        })
+        }
+
+        ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { _, insets ->
+            val cutout = insets.displayCutout
+            val left = cutout?.safeInsetLeft ?: 0
+            val top = cutout?.safeInsetTop ?: 0
+            val right = cutout?.safeInsetRight ?: 0
+            val bottom = cutout?.safeInsetBottom ?: 0
+            rootLayout.setPadding(left, top, right, bottom)
+            insets
+        }
+
+        setContentView(rootLayout)
 
         ContextCompat.registerReceiver(
             this, permReceiver, IntentFilter(permAction), ContextCompat.RECEIVER_NOT_EXPORTED
@@ -317,9 +389,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showIntervalDialog(s: CanonSession) {
+        val density = resources.displayMetrics.density
+        val padPx = (16 * density).toInt()
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(32, 16, 32, 16)
+            setPadding(padPx, padPx / 2, padPx, padPx / 2)
         }
         val intervalInput = EditText(this).apply {
             hint = "Interval in seconds (default 10)"
@@ -401,6 +475,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        applyImmersiveMode()
         val dev = usb.deviceList.values.firstOrNull { it.vendorId == canonVendorId }
         if (dev == null) { setStatus("Plug in the camera (USB-OTG), camera ON"); return }
         if (usb.hasPermission(dev)) {
