@@ -61,7 +61,7 @@ object Settings {
             0 to "P", 1 to "Tv", 2 to "Av", 3 to "M", 4 to "Bulb", 5 to "A-DEP", 6 to "DEP", 7 to "C",
             9 to "Auto", 10 to "Night Portrait", 11 to "Sports", 12 to "Portrait", 13 to "Landscape",
             14 to "Close-up", 15 to "Flash Off", 19 to "CA", 20 to "Movie",
-        )
+        ),
     )
     val EXP_COMP = Prop(0xD104, "Exp comp", 0xFF, emptyMap()) { v ->
         // signed, 1/8 EV units; shown to the nearest 1/3 stop

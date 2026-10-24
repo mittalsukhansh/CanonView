@@ -75,7 +75,7 @@ class HudView(ctx: Context) : View(ctx) {
         val h = height.toFloat()
 
         // ---- 9:16 / 1:1 Aspect Ratio Crop Guides mapped to picture rectangle ----
-        if (aspectGuideMode != 0 && picW > 0 && picH > 0) {
+        if (aspectGuideMode != 0 && (picW > 0) && (picH > 0)) {
             val sc = min(w / picW.toFloat(), h / picH.toFloat())
             val pLeft = (w - picW * sc) / 2f
             val pTop = (h - picH * sc) / 2f
@@ -158,7 +158,10 @@ class HudView(ctx: Context) : View(ctx) {
         var x = 12 * d
         val y1 = topPad + 20 * d
         val mw = big.measureText(mode) + 12 * d
-        tempModeRect.set(x, y1 - 17 * d, x + mw, y1 + 5 * d)
+        tempModeRect.left = x
+        tempModeRect.top = y1 - 17 * d
+        tempModeRect.right = x + mw
+        tempModeRect.bottom = y1 + 5 * d
         c.drawRoundRect(tempModeRect, 4 * d, 4 * d, outline)
         c.drawText(mode, x + 6 * d, y1, big)
         x += mw + 14 * d

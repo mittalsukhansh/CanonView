@@ -16,7 +16,7 @@ data class IntervalPlan(
     val shotsPerInterval: Int = 1,
     val bracketStepThirds: Int = 1,
     val totalEvRamp: Float = 0f,
-    val startTimeClock: String? = null
+    val startTimeClock: String? = null,
 )
 
 /**
@@ -159,7 +159,7 @@ class CanonSession(private val ptp: PtpUsb) {
     fun start() {
         val open = ptp.transact(OC_OPEN_SESSION, intArrayOf(1))
         dbg("OpenSession -> 0x${open.code.toString(16)}")
-        if (open.code != RC_OK && open.code != RC_SESSION_ALREADY_OPEN)
+        if ((open.code != RC_OK) && (open.code != RC_SESSION_ALREADY_OPEN))
             throw PtpException("OpenSession failed: 0x${open.code.toString(16)}")
 
         val rRm = ptp.transact(OC_EOS_SET_REMOTE_MODE, intArrayOf(1))
@@ -387,7 +387,7 @@ class CanonSession(private val ptp: PtpUsb) {
             // Lengthen shutter first
             val maxExpSec = (currIntervalMs / 1000.0) - 3.0
             val desiredShutterCode = baseShutterCode - targetEighths
-            val bestShutter = shutterOpts.filter { code ->
+            val bestShutter = shutterOpts.asSequence().filter { code ->
                 val expSec = if (code <= 0x04) 0.0 else (1.0 / 60.0) * Math.pow(2.0, (0x68 - code) / 8.0)
                 expSec <= maxExpSec
             }.minByOrNull { abs(it - desiredShutterCode) } ?: baseShutterCode
@@ -402,7 +402,6 @@ class CanonSession(private val ptp: PtpUsb) {
         } else if (targetEighths < 0) { // Darkening (sunrise)
             // Lower ISO first
             val desiredIso = baseIsoCode + targetEighths
-            val minIsoOpt = isoOpts.minOrNull() ?: baseIsoCode
             val bestIso = isoOpts.minByOrNull { abs(it - desiredIso) } ?: baseIsoCode
             targetIsoCode = bestIso
             val isoEighthsUsed = targetIsoCode - baseIsoCode
@@ -420,7 +419,10 @@ class CanonSession(private val ptp: PtpUsb) {
 
     private fun tickInterval(): String? {
         if (!intervalRunning) return null
-        val plan = currentPlan ?: run { intervalRunning = false; return null }
+        val plan = currentPlan ?: run {
+            intervalRunning = false
+            return null
+        }
         val now = System.currentTimeMillis()
 
         val shotsLeftCam = values[Settings.SHOTS.id] ?: -1
@@ -549,7 +551,7 @@ class CanonSession(private val ptp: PtpUsb) {
             evfTurnedOffBetweenShots = true
         }
 
-        if (plan.count > 0 && doneShots >= plan.count) {
+        if (plan.count in 1..doneShots) {
             if (evfTurnedOffBetweenShots) {
                 setPropRetry(PROP_EVF_MODE, 1)
                 setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
@@ -599,11 +601,11 @@ class CanonSession(private val ptp: PtpUsb) {
                     }
 
                     var verified = false
-                    for (pTry in 0 until 5) {
+                    repeat(5) {
                         pollEvents()
                         if (values[Settings.SHUTTER.id] == snappedCode) {
                             verified = true
-                            break
+                            return@repeat
                         }
                         Thread.sleep(100)
                     }
@@ -642,11 +644,11 @@ class CanonSession(private val ptp: PtpUsb) {
                     }
 
                     var verified = false
-                    for (pTry in 0 until 5) {
+                    repeat(5) {
                         pollEvents()
                         if (values[Settings.EXP_COMP.id] == snappedCode) {
                             verified = true
-                            break
+                            return@repeat
                         }
                         Thread.sleep(100)
                     }
