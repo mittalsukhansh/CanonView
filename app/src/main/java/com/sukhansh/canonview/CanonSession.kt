@@ -55,6 +55,9 @@ class CanonSession(private val ptp: PtpUsb) {
     /** Callback triggered after shooting a single photo preview. */
     @Volatile var onPhotoCaptured: ((ByteArray) -> Unit)? = null
 
+    /** Flag indicating no memory card present in camera. */
+    @Volatile var noCard = false
+
     /** Intervalometer status. */
     @Volatile var intervalRunning = false
     @Volatile var intervalInfo = ""
@@ -62,6 +65,21 @@ class CanonSession(private val ptp: PtpUsb) {
     private var intervalTargetCount = 0
     private var intervalShotIndex = 0
     private var nextIntervalAt = 0L
+
+    /** Debug log ring buffer (last 25 entries). */
+    val debugLogs = ConcurrentLinkedQueue<String>()
+
+    fun dbg(msg: String) {
+        Log.d("CanonView", msg)
+        debugLogs.add(msg)
+        while (debugLogs.size > 25) {
+            debugLogs.poll()
+        }
+    }
+
+    private var lastAeModeChangeTime = 0L
+    private var lastFrameTime = System.currentTimeMillis()
+    private var lastEvfRecoveryTime = 0L
 
     private sealed class Action {
         class Set(val prop: Int, val value: Int) : Action()
@@ -92,10 +110,6 @@ class CanonSession(private val ptp: PtpUsb) {
     fun requestStopInterval() { pending.add(Action.StopInterval) }
     fun requestBracket(frames: Int, stepThirds: Int) { pending.add(Action.Bracket(frames, stepThirds)) }
 
-    private fun ok(r: PtpResult, what: String) {
-        if (r.code != RC_OK) throw PtpException("$what failed: 0x${r.code.toString(16)}")
-    }
-
     private fun setProp(prop: Int, value: Int): PtpResult {
         val b = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
         b.putInt(12); b.putInt(prop); b.putInt(value)
@@ -116,52 +130,128 @@ class CanonSession(private val ptp: PtpUsb) {
 
     fun start() {
         val open = ptp.transact(OC_OPEN_SESSION, intArrayOf(1))
+        dbg("OpenSession -> 0x${open.code.toString(16)}")
         if (open.code != RC_OK && open.code != RC_SESSION_ALREADY_OPEN)
             throw PtpException("OpenSession failed: 0x${open.code.toString(16)}")
 
-        ok(ptp.transact(OC_EOS_SET_REMOTE_MODE, intArrayOf(1)), "SetRemoteMode")
-        ok(ptp.transact(OC_EOS_SET_EVENT_MODE, intArrayOf(1)), "SetEventMode")
+        val rRm = ptp.transact(OC_EOS_SET_REMOTE_MODE, intArrayOf(1))
+        dbg("SetRemoteMode -> 0x${rRm.code.toString(16)}")
+        val rEm = ptp.transact(OC_EOS_SET_EVENT_MODE, intArrayOf(1))
+        dbg("SetEventMode -> 0x${rEm.code.toString(16)}")
 
         repeat(4) { pollEvents(); Thread.sleep(50) }
 
+        var dTries = 0
+        while (!values.containsKey(0xD11C) && dTries < 10) {
+            pollEvents()
+            Thread.sleep(100)
+            dTries++
+        }
+        val destVal = values[0xD11C]
+        dbg("Capture dest (0xD11C) value=$destVal")
+        if (destVal == 4) {
+            val destOpts = options[0xD11C]
+            val validOpt = destOpts?.firstOrNull { it != 4 } ?: 2
+            if (destOpts != null && destOpts.all { it == 4 }) {
+                noCard = true
+                dbg("No memory card detected: capture dest only 4 (PC)")
+            } else {
+                val rDest = setPropRetry(0xD11C, validOpt)
+                dbg("Changed capture dest from PC (4) to $validOpt res=0x${rDest.code.toString(16)}")
+            }
+        }
+
         val evf = setProp(PROP_EVF_MODE, 1)
+        dbg("SetProp EvfMode -> 0x${evf.code.toString(16)}")
         if (evf.code != RC_OK && evf.code != RC_DEVICE_BUSY)
             throw PtpException("SetProp EvfMode failed: 0x${evf.code.toString(16)}")
-        ok(setProp(PROP_EVF_OUTPUT_DEVICE, 2), "SetProp EvfOutputDevice")
+        val rOut = setProp(PROP_EVF_OUTPUT_DEVICE, 2)
+        dbg("SetProp EvfOutputDevice -> 0x${rOut.code.toString(16)}")
     }
 
     /** Runs queued actions (settings, focus, shutter, intervalometer, bracketing); returns a message for any that failed. */
     fun applyPending(): String? {
         var err: String? = null
         var ran = false
+
+        if (System.currentTimeMillis() - lastAeModeChangeTime < 1500) {
+            pollEvents()
+            Thread.sleep(50)
+        }
+
         while (true) {
             val a = pending.poll() ?: break
             ran = true
             when (a) {
                 is Action.Set -> {
-                    val r = setProp(a.prop, a.value)
-                    if (r.code != RC_OK) err = "Set failed: 0x${r.code.toString(16)} (check mode dial)"
+                    val r = setPropRetry(a.prop, a.value)
+                    dbg("Action.Set prop=0x${a.prop.toString(16)} val=${a.value} res=0x${r.code.toString(16)}")
+                    if (r.code != RC_OK) {
+                        val propObj = Settings.tracked.firstOrNull { it.id == a.prop }
+                        val propName = propObj?.name ?: "0x${a.prop.toString(16)}"
+                        val currentModeVal = values[Settings.AE_MODE.id] ?: 0
+                        val currentModeName = Settings.label(Settings.AE_MODE, currentModeVal)
+                        err = "Set $propName failed 0x${r.code.toString(16)} in mode $currentModeName"
+                    }
                 }
                 is Action.Focus -> {
-                    val z = ptp.transact(OC_EOS_ZOOM_POSITION, intArrayOf(a.x, a.y))
-                    val f = ptp.transact(OC_EOS_DO_AF, timeoutMs = 8000)
-                    Log.d("CanonView", "AF x=${a.x} y=${a.y} zoomPos=0x${z.code.toString(16)} doAf=0x${f.code.toString(16)}")
-                    if (f.code != RC_OK) err = "AF failed: 0x${f.code.toString(16)}"
+                    val focusModeVal = values[Settings.FOCUS_MODE.id]
+                    if (focusModeVal == 3) {
+                        err = "Camera/lens is in manual focus: set the lens switch to AF"
+                        dbg("AF requested while in MF mode")
+                    } else {
+                        val z = ptp.transact(OC_EOS_ZOOM_POSITION, intArrayOf(a.x, a.y))
+                        dbg("AF ZoomPosition x=${a.x} y=${a.y} code=0x${z.code.toString(16)}")
+
+                        var f = ptp.transact(OC_EOS_DO_AF, timeoutMs = 8000)
+                        var afTries = 0
+                        while (f.code == RC_DEVICE_BUSY && afTries < 5) {
+                            Thread.sleep(200)
+                            pollEvents()
+                            f = ptp.transact(OC_EOS_DO_AF, timeoutMs = 8000)
+                            afTries++
+                        }
+                        dbg("AF DoAf code=0x${f.code.toString(16)} (tries=$afTries)")
+
+                        var halfCode = RC_OK
+                        if (f.code != RC_OK) {
+                            val halfRes = ptp.transact(OC_EOS_REMOTE_RELEASE_ON, intArrayOf(1, 0), timeoutMs = 3000)
+                            halfCode = halfRes.code
+                            var hTries = 0
+                            while (hTries < 30) {
+                                pollEvents()
+                                Thread.sleep(100)
+                                hTries++
+                            }
+                            ptp.transact(OC_EOS_REMOTE_RELEASE_OFF, intArrayOf(1))
+                            dbg("AF half-press fallback code=0x${halfCode.toString(16)}")
+                        }
+
+                        val cancelRes = ptp.transact(0x9160) // AfCancel
+                        dbg("AF AfCancel code=0x${cancelRes.code.toString(16)}")
+                        pollEvents()
+                        setPropRetry(PROP_EVF_MODE, 1)
+                        setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
+
+                        if (f.code != RC_OK && halfCode != RC_OK) {
+                            err = "AF failed: zoomPos=0x${z.code.toString(16)} doAf=0x${f.code.toString(16)} half=0x${halfCode.toString(16)}"
+                        }
+                    }
                 }
                 is Action.DriveLens -> {
                     val r = ptp.transact(OC_EOS_DRIVE_LENS, intArrayOf(a.step))
-                    Log.d("CanonView", "drive lens step=0x${a.step.toString(16)} code=0x${r.code.toString(16)}")
+                    dbg("drive lens step=0x${a.step.toString(16)} code=0x${r.code.toString(16)}")
                     if (r.code != RC_OK) err = "Lens drive failed: 0x${r.code.toString(16)}"
                 }
                 is Action.Zoom -> {
                     val r = ptp.transact(0x9158, intArrayOf(a.level))
-                    Log.d("CanonView", "evf zoom level=${a.level} code=0x${r.code.toString(16)}")
+                    dbg("evf zoom level=${a.level} code=0x${r.code.toString(16)}")
                     if (r.code != RC_OK) err = "Zoom failed: 0x${r.code.toString(16)}"
                 }
                 Action.Shoot -> shoot(af = true)?.let { err = it }
                 Action.Flash -> {
                     val r = ptp.transact(OC_EOS_POPUP_FLASH)
-                    Log.d("CanonView", "popup flash: 0x${r.code.toString(16)}")
+                    dbg("popup flash: 0x${r.code.toString(16)}")
                     if (r.code != RC_OK) err = "Flash failed: 0x${r.code.toString(16)} (use P/Av/Tv/M mode)"
                 }
                 is Action.StartInterval -> {
@@ -170,10 +260,12 @@ class CanonSession(private val ptp: PtpUsb) {
                     intervalTargetCount = a.count
                     intervalShotIndex = 0
                     nextIntervalAt = System.currentTimeMillis()
+                    dbg("StartInterval sec=${a.seconds} count=${a.count}")
                 }
                 Action.StopInterval -> {
                     intervalRunning = false
                     intervalInfo = ""
+                    dbg("StopInterval")
                 }
                 is Action.Bracket -> {
                     doBracket(a.frames, a.stepThirds)?.let { err = it }
@@ -192,17 +284,20 @@ class CanonSession(private val ptp: PtpUsb) {
 
         intervalShotIndex++
         intervalInfo = if (intervalTargetCount > 0) "Interval $intervalShotIndex/$intervalTargetCount" else "Interval $intervalShotIndex/inf"
+        dbg("Interval shot $intervalShotIndex starting...")
 
         val err = shoot(af = false)
         if (err != null) {
             intervalRunning = false
             intervalInfo = ""
+            dbg("Interval stopped due to error: $err")
             return err
         }
 
         if (intervalTargetCount in 1..intervalShotIndex) {
             intervalRunning = false
             intervalInfo = ""
+            dbg("Interval finished target count reached")
         } else {
             nextIntervalAt = now + (intervalSeconds * 1000L)
         }
@@ -212,6 +307,7 @@ class CanonSession(private val ptp: PtpUsb) {
     private fun doBracket(frames: Int, stepThirds: Int): String? {
         val aeMode = values[Settings.AE_MODE.id] ?: -1
         var err: String? = null
+        dbg("Start Bracket frames=$frames stepThirds=$stepThirds aeMode=$aeMode")
 
         if (aeMode == 3) { // Manual Mode -> vary Shutter Speed
             val baseCode = values[Settings.SHUTTER.id] ?: 0
@@ -225,8 +321,29 @@ class CanonSession(private val ptp: PtpUsb) {
                     val offset8th = round(k * stepThirds * 8f / 3f).toInt()
                     val targetCode = baseCode - offset8th
                     val snappedCode = shutterOpts.minByOrNull { Math.abs(it - targetCode) } ?: targetCode
-                    setPropRetry(Settings.SHUTTER.id, snappedCode)
-                    pollEvents()
+
+                    dbg("Bracket shutter step k=$k targetCode=$targetCode snappedCode=$snappedCode")
+                    val rSet = setPropRetry(Settings.SHUTTER.id, snappedCode)
+                    if (rSet.code != RC_OK) {
+                        return "Bracket: camera refused shutter change (0x${rSet.code.toString(16)})"
+                    }
+
+                    var verified = false
+                    for (pTry in 0 until 5) {
+                        pollEvents()
+                        if (values[Settings.SHUTTER.id] == snappedCode) {
+                            verified = true
+                            break
+                        }
+                        Thread.sleep(100)
+                    }
+                    val currentVal = values[Settings.SHUTTER.id] ?: 0
+                    dbg("Bracket set shutter result: res=0x${rSet.code.toString(16)} currentVal=$currentVal verified=$verified")
+                    if (!verified) {
+                        val stillLabel = Settings.label(Settings.SHUTTER, currentVal)
+                        return "Bracket: value did not change (still $stillLabel)"
+                    }
+
                     err = shoot(af = false)
                     if (err != null) break
                 }
@@ -247,8 +364,29 @@ class CanonSession(private val ptp: PtpUsb) {
                     val offset8th = round(k * stepThirds * 8f / 3f).toInt()
                     val targetSigned = baseSigned + offset8th
                     val snappedCode = expOpts.minByOrNull { Math.abs(it.toByte().toInt() - targetSigned) } ?: baseCode
-                    setPropRetry(Settings.EXP_COMP.id, snappedCode)
-                    pollEvents()
+
+                    dbg("Bracket expComp step k=$k targetSigned=$targetSigned snappedCode=$snappedCode")
+                    val rSet = setPropRetry(Settings.EXP_COMP.id, snappedCode)
+                    if (rSet.code != RC_OK) {
+                        return "Bracket: camera refused exp comp change (0x${rSet.code.toString(16)})"
+                    }
+
+                    var verified = false
+                    for (pTry in 0 until 5) {
+                        pollEvents()
+                        if (values[Settings.EXP_COMP.id] == snappedCode) {
+                            verified = true
+                            break
+                        }
+                        Thread.sleep(100)
+                    }
+                    val currentVal = values[Settings.EXP_COMP.id] ?: 0
+                    dbg("Bracket set expComp result: res=0x${rSet.code.toString(16)} currentVal=$currentVal verified=$verified")
+                    if (!verified) {
+                        val stillLabel = Settings.label(Settings.EXP_COMP, currentVal)
+                        return "Bracket: value did not change (still $stillLabel)"
+                    }
+
                     err = shoot(af = false)
                     if (err != null) break
                 }
@@ -264,14 +402,18 @@ class CanonSession(private val ptp: PtpUsb) {
 
     /** Shutter release: with AF (default, af = true) or without AF (af = false). Photo goes to the camera's card. */
     private fun shoot(af: Boolean = true): String? {
+        if (noCard) {
+            dbg("shoot() rejected: noCard is true")
+            return "No memory card: camera would only save to PC"
+        }
         pollEvents()
         var err: String? = null
         if (af) {
             val half = ptp.transact(OC_EOS_REMOTE_RELEASE_ON, intArrayOf(1, 0), timeoutMs = 10_000)
-            Log.d("CanonView", "half-press: 0x${half.code.toString(16)}")
+            dbg("shoot(af=true) half-press: 0x${half.code.toString(16)}")
             pollEvents()
             val full = ptp.transact(OC_EOS_REMOTE_RELEASE_ON, intArrayOf(2, 0), timeoutMs = 10_000)
-            Log.d("CanonView", "full-press: 0x${full.code.toString(16)}")
+            dbg("shoot(af=true) full-press: 0x${full.code.toString(16)}")
             if (full.code != RC_OK) {
                 err = "Shutter failed: 0x${full.code.toString(16)} (half-press 0x${half.code.toString(16)})"
             } else {
@@ -286,7 +428,7 @@ class CanonSession(private val ptp: PtpUsb) {
             ptp.transact(OC_EOS_REMOTE_RELEASE_OFF, intArrayOf(1))
         } else {
             val full = ptp.transact(OC_EOS_REMOTE_RELEASE_ON, intArrayOf(3, 1), timeoutMs = 10_000)
-            Log.d("CanonView", "full-press (no-AF): 0x${full.code.toString(16)}")
+            dbg("shoot(af=false) full-press no-AF: 0x${full.code.toString(16)}")
             if (full.code != RC_OK) {
                 err = "Shutter failed: 0x${full.code.toString(16)}"
             }
@@ -296,12 +438,13 @@ class CanonSession(private val ptp: PtpUsb) {
         val shutterCode = values[Settings.SHUTTER.id] ?: 0x68
         val expSec = if (shutterCode <= 0x04) 0.0 else (1.0 / 60.0) * Math.pow(2.0, (0x68 - shutterCode) / 8.0)
         val sleepMs = ((expSec + 0.6) * 1000.0).toLong().coerceIn(400L, 120_000L)
+        dbg("shoot sleeping $sleepMs ms for exposure")
         Thread.sleep(sleepMs)
         pollEvents()
 
-        // The mirror drops for the exposure, so switch live view back on with retry.
-        setPropRetry(PROP_EVF_MODE, 1)
-        setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
+        val rEvf1 = setPropRetry(PROP_EVF_MODE, 1)
+        val rEvf2 = setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
+        dbg("shoot EVF restore res1=0x${rEvf1.code.toString(16)} res2=0x${rEvf2.code.toString(16)}")
         return err
     }
 
@@ -320,8 +463,17 @@ class CanonSession(private val ptp: PtpUsb) {
                     val prop = bb.getInt(pos + 8)
                     val p = tracked[prop]
                     if (p != null) {
-                        values[prop] = bb.getInt(pos + 12) and p.mask
-                        changed = true
+                        val newV = bb.getInt(pos + 12) and p.mask
+                        if (values[prop] != newV) {
+                            values[prop] = newV
+                            changed = true
+                            if (prop == Settings.AE_MODE.id) {
+                                lastAeModeChangeTime = System.currentTimeMillis()
+                                dbg("AE_MODE changed to 0x${newV.toString(16)}")
+                            } else if (prop == Settings.CAPTURE_DEST.id) {
+                                dbg("CAPTURE_DEST changed to $newV")
+                            }
+                        }
                     }
                 }
                 EC_AVAIL_LIST_CHANGED -> if (size >= 20) {
@@ -329,9 +481,15 @@ class CanonSession(private val ptp: PtpUsb) {
                     val p = tracked[prop]
                     val type = bb.getInt(pos + 12)
                     val count = bb.getInt(pos + 16)
-                    if (p != null && type == 3 && count in 1..512 && 20 + count * 4 <= size) {
-                        options[prop] = List(count) { bb.getInt(pos + 20 + it * 4) and p.mask }
-                        changed = true
+                    if (p != null && type == 3) {
+                        if (count == 0) {
+                            options.remove(prop)
+                            changed = true
+                            dbg("Options for prop=0x${prop.toString(16)} cleared (count=0)")
+                        } else if (count in 1..512 && 20 + count * 4 <= size) {
+                            options[prop] = List(count) { bb.getInt(pos + 20 + it * 4) and p.mask }
+                            changed = true
+                        }
                     }
                 }
             }
@@ -351,15 +509,37 @@ class CanonSession(private val ptp: PtpUsb) {
         val r = ptp.transact(OC_EOS_GET_VIEWFINDER, intArrayOf(0x00200000, 0, 0), timeoutMs = 2000)
         if (r.code == RC_DEVICE_BUSY || r.code == RC_NOT_READY_YET) {
             lastInfo = "camera not ready (0x${r.code.toString(16)})"
+            checkEvfRecovery(now)
             return null
         }
-        if (r.code != RC_OK) throw PtpException("GetViewFinder failed: 0x${r.code.toString(16)}")
+        if (r.code != RC_OK) {
+            checkEvfRecovery(now)
+            throw PtpException("GetViewFinder failed: 0x${r.code.toString(16)}")
+        }
         val d = r.data
-        if (d == null) { lastInfo = "OK but no data"; return null }
+        if (d == null) {
+            lastInfo = "OK but no data"
+            checkEvfRecovery(now)
+            return null
+        }
         val jpg = extractJpeg(d)
-        if (jpg != null) { lastViewFrame = jpg }
+        if (jpg != null) {
+            lastViewFrame = jpg
+            lastFrameTime = now
+        } else {
+            checkEvfRecovery(now)
+        }
         lastInfo = if (jpg == null) "no JPEG in ${d.size} bytes" else ""
         return jpg
+    }
+
+    private fun checkEvfRecovery(now: Long) {
+        if (now - lastFrameTime > 3000 && now - lastEvfRecoveryTime > 3000) {
+            lastEvfRecoveryTime = now
+            dbg("Live View lost >3s, running EVF recovery...")
+            setPropRetry(PROP_EVF_MODE, 1)
+            setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
+        }
     }
 
     fun stop() {

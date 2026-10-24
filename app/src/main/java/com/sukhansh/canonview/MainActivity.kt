@@ -11,6 +11,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.Typeface
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
@@ -20,6 +21,7 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.util.Log
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -59,6 +61,10 @@ class MainActivity : AppCompatActivity() {
     // Photo Preview Overlay
     private lateinit var previewCard: FrameLayout
     private lateinit var previewImage: ImageView
+
+    // Debug Log Overlay
+    private lateinit var logOverlay: TextView
+    private var showLogOverlay = false
 
     @Volatile private var running = false
     @Volatile private var session: CanonSession? = null
@@ -124,6 +130,21 @@ class MainActivity : AppCompatActivity() {
         status = TextView(this).apply {
             setTextColor(Color.WHITE)
             setPadding((12 * density).toInt(), (8 * density).toInt(), (12 * density).toInt(), (8 * density).toInt())
+            setOnLongClickListener {
+                showLogOverlay = !showLogOverlay
+                logOverlay.visibility = if (showLogOverlay) View.VISIBLE else View.GONE
+                Toast.makeText(this@MainActivity, if (showLogOverlay) "Log Overlay On" else "Log Overlay Off", Toast.LENGTH_SHORT).show()
+                true
+            }
+        }
+
+        logOverlay = TextView(this).apply {
+            setTextColor(Color.GREEN)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            typeface = Typeface.MONOSPACE
+            setBackgroundColor(0x88000000.toInt())
+            visibility = View.GONE
+            setPadding((8 * density).toInt(), (8 * density).toInt(), (8 * density).toInt(), (8 * density).toInt())
         }
 
         buttons = Settings.all.associateWith { p ->
@@ -149,7 +170,7 @@ class MainActivity : AppCompatActivity() {
                     inv.mapPoints(pt)
                     if (pt[0] in 0f..d.intrinsicWidth.toFloat() && pt[1] in 0f..d.intrinsicHeight.toFloat()) {
                         session?.requestFocus(pt[0].toInt(), pt[1].toInt())
-                        Toast.makeText(this, "AF ${pt[0].toInt()},${pt[1].toInt()}", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this, "AF sent", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
@@ -363,6 +384,10 @@ class MainActivity : AppCompatActivity() {
             addView(image, FrameLayout.LayoutParams(-1, -1))
             addView(hud, FrameLayout.LayoutParams(-1, -1))
             addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
+            addView(logOverlay, FrameLayout.LayoutParams((350 * density).toInt(), (200 * density).toInt(), Gravity.TOP or Gravity.START).apply {
+                topMargin = (90 * density).toInt()
+                marginStart = (12 * density).toInt()
+            })
             addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
             addView(sideScroll, sideScrollParams)
             addView(previewCard, FrameLayout.LayoutParams(previewWidthPx, previewHeightPx, Gravity.TOP or Gravity.END).apply {
@@ -634,6 +659,9 @@ class MainActivity : AppCompatActivity() {
                         hud.focusPoints = focusPoints
                         hud.invalidate()
                         intervalBtn.text = if (cs.intervalRunning) "STOP" else "INTERVAL"
+                        if (showLogOverlay) {
+                            logOverlay.text = cs.debugLogs.joinToString("\n")
+                        }
                     }
                     frames++
                     val now = System.currentTimeMillis()

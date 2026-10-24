@@ -84,10 +84,11 @@ object Settings {
     ))
     val BATTERY = Prop(0xD111, "Battery", 0xFFFF, mapOf(0 to "Low", 1 to "50%", 2 to "100%", 4 to "75%", 5 to "25%"))
     val SHOTS = Prop(0xD11B, "Shots", -1, emptyMap()) { v -> v.toString() }
+    val CAPTURE_DEST = Prop(0xD11C, "Save to", -1, mapOf(2 to "Card", 4 to "PC"))
 
     /** Editable settings (bottom buttons): ISO, Aperture, Shutter, WB, Drive (method/timer), Metering. */
     val all = listOf(ISO, APERTURE, SHUTTER, WB, DRIVE, METERING)
-    val info = listOf(AE_MODE, EXP_COMP, DRIVE, METERING, FOCUS_MODE, STYLE, BATTERY, SHOTS)
+    val info = listOf(AE_MODE, EXP_COMP, DRIVE, METERING, FOCUS_MODE, STYLE, BATTERY, SHOTS, CAPTURE_DEST)
     /** Everything we read from the camera's event stream. */
     val tracked = (all + info).distinctBy { it.id }
 
