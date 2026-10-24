@@ -23,9 +23,11 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -42,6 +44,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var status: TextView
     private lateinit var hud: HudView
     private lateinit var buttons: Map<Settings.Prop, Button>
+    private lateinit var intervalBtn: Button
 
     // Photo Preview Overlay
     private lateinit var previewCard: FrameLayout
@@ -182,6 +185,53 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        val gridBtn = Button(this).apply {
+            text = "GRID OFF"
+            textSize = 12f
+            minHeight = 0
+            setOnClickListener {
+                hud.gridMode = (hud.gridMode + 1) % 3
+                text = when (hud.gridMode) {
+                    1 -> "GRID 3x3"
+                    2 -> "GRID 3x3+"
+                    else -> "GRID OFF"
+                }
+                hud.invalidate()
+            }
+        }
+
+        intervalBtn = Button(this).apply {
+            text = "INTERVAL"
+            textSize = 12f
+            minHeight = 0
+            setOnClickListener {
+                val s = session
+                if (s == null) {
+                    Toast.makeText(this@MainActivity, "Camera not connected", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                if (s.intervalRunning) {
+                    s.requestStopInterval()
+                } else {
+                    showIntervalDialog(s)
+                }
+            }
+        }
+
+        val bracketBtn = Button(this).apply {
+            text = "BRACKET"
+            textSize = 12f
+            minHeight = 0
+            setOnClickListener {
+                val s = session
+                if (s == null) {
+                    Toast.makeText(this@MainActivity, "Camera not connected", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                showBracketDialog(s)
+            }
+        }
+
         // MF Lens Step Buttons: Near / Far
         val nearFarBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -215,7 +265,14 @@ class MainActivity : AppCompatActivity() {
             addView(zoomBtn)
             addView(peakBtn)
             addView(aspectBtn)
+            addView(gridBtn)
+            addView(intervalBtn)
+            addView(bracketBtn)
             addView(nearFarBar)
+        }
+
+        val sideScroll = ScrollView(this).apply {
+            addView(side)
         }
 
         // --- Photo Preview Overlay ---
@@ -237,7 +294,7 @@ class MainActivity : AppCompatActivity() {
             addView(hud, FrameLayout.LayoutParams(-1, -1))
             addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
             addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
-            addView(side, FrameLayout.LayoutParams(320, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = 24 })
+            addView(sideScroll, FrameLayout.LayoutParams(320, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = 24 })
             addView(previewCard, FrameLayout.LayoutParams(400, 300, Gravity.TOP or Gravity.END).apply {
                 topMargin = 40
                 marginEnd = 40
@@ -247,6 +304,70 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.registerReceiver(
             this, permReceiver, IntentFilter(permAction), ContextCompat.RECEIVER_NOT_EXPORTED
         )
+    }
+
+    private fun showIntervalDialog(s: CanonSession) {
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 16, 32, 16)
+        }
+        val intervalInput = EditText(this).apply {
+            hint = "Interval in seconds (default 10)"
+            setText("10")
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
+        val countInput = EditText(this).apply {
+            hint = "Shots count (0 = infinite)"
+            setText("0")
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
+        layout.addView(TextView(this).apply { text = "Interval (seconds):" })
+        layout.addView(intervalInput)
+        layout.addView(TextView(this).apply { text = "Number of shots (0 = continuous):" })
+        layout.addView(countInput)
+
+        AlertDialog.Builder(this)
+            .setTitle("Intervalometer")
+            .setView(layout)
+            .setPositiveButton("Start") { _, _ ->
+                val sec = intervalInput.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: 10
+                val cnt = countInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+                s.requestStartInterval(sec, cnt)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showBracketDialog(s: CanonSession) {
+        val optionsText = arrayOf(
+            "3 x 1/3 EV",
+            "3 x 2/3 EV",
+            "3 x 1 EV",
+            "5 x 1/3 EV",
+            "5 x 2/3 EV",
+            "5 x 1 EV",
+            "7 x 2/3 EV",
+            "5 x 2 EV"
+        )
+        val params = arrayOf(
+            3 to 1,
+            3 to 2,
+            3 to 3,
+            5 to 1,
+            5 to 2,
+            5 to 3,
+            7 to 2,
+            5 to 6
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle("Exposure Bracketing")
+            .setItems(optionsText) { _, i ->
+                val (f, st) = params[i]
+                s.requestBracket(f, st)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun startCountdown(seconds: Int, onFinish: () -> Unit) {
@@ -420,15 +541,19 @@ class MainActivity : AppCompatActivity() {
                     val stats = analyze(bmp)
                     runOnUiThread {
                         image.setImageBitmap(bmp)
+                        hud.picW = bmp.width
+                        hud.picH = bmp.height
                         hud.estEv = stats.first
                         hud.hist = stats.second
                         hud.focusPoints = stats.third
                         hud.invalidate()
+                        intervalBtn.text = if (cs.intervalRunning) "STOP" else "INTERVAL"
                     }
                     frames++
                     val now = System.currentTimeMillis()
                     if (now - t0 >= 1000) {
-                        setStatus("Live  $frames fps  ${bmp.width}x${bmp.height}")
+                        val intervalStr = if (cs.intervalInfo.isNotEmpty()) "  ·  ${cs.intervalInfo}" else ""
+                        setStatus("Live  $frames fps  ${bmp.width}x${bmp.height}$intervalStr")
                         frames = 0; t0 = now
                     }
                 }

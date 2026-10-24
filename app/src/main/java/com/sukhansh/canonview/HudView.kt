@@ -11,7 +11,7 @@ import android.graphics.Typeface
 import android.view.View
 import kotlin.math.min
 
-/** Read-only replica of the camera's info display + focus peaking + 9:16 aspect guide. */
+/** Read-only replica of the camera's info display + focus peaking + 9:16 aspect guide + 3x3 grid overlay. */
 class HudView(ctx: Context) : View(ctx) {
     var mode = "-"
     var shutter = "-"
@@ -26,12 +26,19 @@ class HudView(ctx: Context) : View(ctx) {
     var estEv: Float? = null
     var hist: IntArray? = null
 
+    /** Live view image pixel dimensions for scaling peaking/guides to FIT_CENTER. */
+    var picW = 0
+    var picH = 0
+
     /** Focus Peaking toggle and high-contrast edge coordinates. */
     var enableFocusPeaking = false
     var focusPoints: FloatArray? = null
 
     /** Aspect guide mode: 0 = Off, 1 = 9:16 Portrait (Reels/TikTok), 2 = 1:1 Square. */
     var aspectGuideMode = 0
+
+    /** Composition grid mode: 0 = Off, 1 = Rule of Thirds, 2 = Thirds + Center Cross. */
+    var gridMode = 0
 
     private val d = ctx.resources.displayMetrics.density
     private val topPad = 30 * d
@@ -54,46 +61,93 @@ class HudView(ctx: Context) : View(ctx) {
         color = 0xFFFFD60A.toInt(); style = Paint.Style.STROKE; strokeWidth = 2f * d
         pathEffect = DashPathEffect(floatArrayOf(12f, 8f), 0f)
     }
+    private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x80FFFFFF.toInt(); style = Paint.Style.STROKE; strokeWidth = 1.5f * d
+    }
     private val histPaint = Paint().apply { color = 0xCCFFFFFF.toInt(); strokeWidth = 2f * d }
 
     override fun onDraw(c: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
 
-        // ---- 9:16 / 1:1 Aspect Ratio Crop Guides ----
-        if (aspectGuideMode == 1) { // 9:16 Portrait
-            val targetW = h * (9f / 16f)
-            val cropW = min(w, targetW)
-            val left = (w - cropW) / 2f
-            val right = left + cropW
-            // Draw darkened side bars
-            if (left > 0) {
-                c.drawRect(0f, 0f, left, h, cropMask)
-                c.drawRect(right, 0f, w, h, cropMask)
-                c.drawRect(left, 0f, right, h, cropGuidePaint)
-            } else {
-                val targetH = w * (16f / 9f)
-                val top = (h - targetH) / 2f
-                val bottom = top + targetH
-                c.drawRect(0f, 0f, w, top, cropMask)
-                c.drawRect(0f, bottom, w, h, cropMask)
-                c.drawRect(0f, top, w, bottom, cropGuidePaint)
+        // ---- 9:16 / 1:1 Aspect Ratio Crop Guides mapped to picture rectangle ----
+        if (aspectGuideMode != 0 && picW > 0 && picH > 0) {
+            val sc = min(w / picW.toFloat(), h / picH.toFloat())
+            val pLeft = (w - picW * sc) / 2f
+            val pTop = (h - picH * sc) / 2f
+            val pRight = pLeft + picW * sc
+            val pBottom = pTop + picH * sc
+            val pw = picW * sc
+            val ph = picH * sc
+
+            if (aspectGuideMode == 1) { // 9:16 Portrait
+                val targetW = ph * (9f / 16f)
+                val cropW = min(pw, targetW)
+                val left = pLeft + (pw - cropW) / 2f
+                val right = left + cropW
+                if (left > pLeft) {
+                    c.drawRect(pLeft, pTop, left, pBottom, cropMask)
+                    c.drawRect(right, pTop, pRight, pBottom, cropMask)
+                    c.drawRect(left, pTop, right, pBottom, cropGuidePaint)
+                } else {
+                    val targetH = pw * (16f / 9f)
+                    val cropH = min(ph, targetH)
+                    val top = pTop + (ph - cropH) / 2f
+                    val bottom = top + cropH
+                    c.drawRect(pLeft, pTop, pRight, top, cropMask)
+                    c.drawRect(pLeft, bottom, pRight, pBottom, cropMask)
+                    c.drawRect(pLeft, top, pRight, bottom, cropGuidePaint)
+                }
+            } else if (aspectGuideMode == 2) { // 1:1 Square
+                val side = min(pw, ph)
+                val left = pLeft + (pw - side) / 2f
+                val top = pTop + (ph - side) / 2f
+                c.drawRect(pLeft, pTop, left, pBottom, cropMask)
+                c.drawRect(left + side, pTop, pRight, pBottom, cropMask)
+                c.drawRect(left, pTop, left + side, top, cropMask)
+                c.drawRect(left, top + side, left + side, pBottom, cropMask)
+                c.drawRect(left, top, left + side, top + side, cropGuidePaint)
             }
-        } else if (aspectGuideMode == 2) { // 1:1 Square
-            val side = min(w, h)
-            val left = (w - side) / 2f
-            val top = (h - side) / 2f
-            c.drawRect(0f, 0f, left, h, cropMask)
-            c.drawRect(left + side, 0f, w, h, cropMask)
-            c.drawRect(left, 0f, left + side, top, cropMask)
-            c.drawRect(left, top + side, left + side, h, cropMask)
-            c.drawRect(left, top, left + side, top + side, cropGuidePaint)
         }
 
-        // ---- Focus Peaking (Green Edge Overlay) ----
-        if (enableFocusPeaking && focusPoints != null) {
-            val pts = focusPoints!!
-            c.drawPoints(pts, greenPeak)
+        // ---- Composition Grid mapped to picture rectangle ----
+        if (gridMode != 0 && picW > 0 && picH > 0) {
+            val sc = min(w / picW.toFloat(), h / picH.toFloat())
+            val pLeft = (w - picW * sc) / 2f
+            val pTop = (h - picH * sc) / 2f
+            val pw = picW * sc
+            val ph = picH * sc
+
+            val x1 = pLeft + pw / 3f
+            val x2 = pLeft + pw * 2f / 3f
+            val y1Grid = pTop + ph / 3f
+            val y2Grid = pTop + ph * 2f / 3f
+
+            c.drawLine(x1, pTop, x1, pTop + ph, gridPaint)
+            c.drawLine(x2, pTop, x2, pTop + ph, gridPaint)
+            c.drawLine(pLeft, y1Grid, pLeft + pw, y1Grid, gridPaint)
+            c.drawLine(pLeft, y2Grid, pLeft + pw, y2Grid, gridPaint)
+
+            if (gridMode == 2) { // Thirds + Center Cross
+                val cx = pLeft + pw / 2f
+                val cy = pTop + ph / 2f
+                val arm = 12 * d
+                c.drawLine(cx - arm, cy, cx + arm, cy, gridPaint)
+                c.drawLine(cx, cy - arm, cx, cy + arm, gridPaint)
+            }
+        }
+
+        // ---- Focus Peaking (Green Edge Overlay mapped to picture rectangle) ----
+        if (enableFocusPeaking && focusPoints != null && picW > 0 && picH > 0) {
+            val sc = min(w / picW.toFloat(), h / picH.toFloat())
+            val left = (w - picW * sc) / 2f
+            val top = (h - picH * sc) / 2f
+            c.save()
+            c.translate(left, top)
+            c.scale(sc, sc)
+            greenPeak.strokeWidth = 3f * d / sc
+            c.drawPoints(focusPoints!!, greenPeak)
+            c.restore()
         }
 
         // ---- top strip: mode, shutter, aperture, ISO | battery, shots ----
