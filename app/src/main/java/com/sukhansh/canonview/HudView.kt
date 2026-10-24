@@ -9,6 +9,7 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.View
+import androidx.core.graphics.withTranslation
 import kotlin.math.min
 
 /** Read-only replica of the camera's info display + focus peaking + 9:16 aspect guide + 3x3 grid overlay. */
@@ -65,6 +66,7 @@ class HudView(ctx: Context) : View(ctx) {
         color = 0x80FFFFFF.toInt(); style = Paint.Style.STROKE; strokeWidth = 1.5f * d
     }
     private val histPaint = Paint().apply { color = 0xCCFFFFFF.toInt(); strokeWidth = 2f * d }
+    private val tempModeRect = RectF()
 
     override fun onDraw(c: Canvas) {
         val w = width.toFloat()
@@ -142,12 +144,11 @@ class HudView(ctx: Context) : View(ctx) {
             val sc = min(w / picW.toFloat(), h / picH.toFloat())
             val left = (w - picW * sc) / 2f
             val top = (h - picH * sc) / 2f
-            c.save()
-            c.translate(left, top)
-            c.scale(sc, sc)
-            greenPeak.strokeWidth = 3f * d / sc
-            c.drawPoints(focusPoints!!, greenPeak)
-            c.restore()
+            c.withTranslation(left, top) {
+                scale(sc, sc)
+                greenPeak.strokeWidth = 3f * d / sc
+                drawPoints(focusPoints!!, greenPeak)
+            }
         }
 
         // ---- top strip: mode, shutter, aperture, ISO | battery, shots ----
@@ -155,7 +156,8 @@ class HudView(ctx: Context) : View(ctx) {
         var x = 12 * d
         val y1 = topPad + 30 * d
         val mw = big.measureText(mode) + 16 * d
-        c.drawRoundRect(RectF(x, y1 - 24 * d, x + mw, y1 + 7 * d), 6 * d, 6 * d, outline)
+        tempModeRect.set(x, y1 - 24 * d, x + mw, y1 + 7 * d)
+        c.drawRoundRect(tempModeRect, 6 * d, 6 * d, outline)
         c.drawText(mode, x + 8 * d, y1, big)
         x += mw + 16 * d
         for (s in listOf(shutter, aperture, "ISO $iso")) {

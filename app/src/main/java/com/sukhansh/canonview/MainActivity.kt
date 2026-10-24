@@ -1,16 +1,16 @@
 package com.sukhansh.canonview
 
+import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.annotation.SuppressLint
 import android.graphics.Color
 import android.graphics.Matrix
-import android.view.MotionEvent
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
@@ -18,8 +18,10 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.util.Log
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
@@ -32,6 +34,10 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.get
+import kotlin.math.abs
+import kotlin.math.log2
+import kotlin.math.pow
 
 class MainActivity : AppCompatActivity() {
 
@@ -78,7 +84,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        usb = getSystemService(Context.USB_SERVICE) as UsbManager
+        usb = getSystemService(USB_SERVICE) as UsbManager
 
         image = ImageView(this).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
@@ -92,7 +98,8 @@ class MainActivity : AppCompatActivity() {
 
         buttons = Settings.all.associateWith { p ->
             Button(this).apply {
-                text = "${p.name} -"
+                val btnText = "${p.name} -"
+                text = btnText
                 setOnClickListener { pick(p) }
             }
         }
@@ -121,7 +128,8 @@ class MainActivity : AppCompatActivity() {
 
         // --- Side Tools Layout ---
         val shutter = Button(this).apply {
-            text = "SHOOT"
+            val shootLabel = "SHOOT"
+            text = shootLabel
             setOnClickListener {
                 val s = session
                 if (s == null) {
@@ -294,7 +302,9 @@ class MainActivity : AppCompatActivity() {
             addView(hud, FrameLayout.LayoutParams(-1, -1))
             addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
             addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
-            addView(sideScroll, FrameLayout.LayoutParams(320, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { marginEnd = 24 })
+            addView(sideScroll, FrameLayout.LayoutParams(320, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply {
+                marginEnd = 24
+            })
             addView(previewCard, FrameLayout.LayoutParams(400, 300, Gravity.TOP or Gravity.END).apply {
                 topMargin = 40
                 marginEnd = 40
@@ -314,12 +324,12 @@ class MainActivity : AppCompatActivity() {
         val intervalInput = EditText(this).apply {
             hint = "Interval in seconds (default 10)"
             setText("10")
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            inputType = InputType.TYPE_CLASS_NUMBER
         }
         val countInput = EditText(this).apply {
             hint = "Shots count (0 = infinite)"
             setText("0")
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            inputType = InputType.TYPE_CLASS_NUMBER
         }
         layout.addView(TextView(this).apply { text = "Interval (seconds):" })
         layout.addView(intervalInput)
@@ -442,7 +452,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** Brightness stats and focus peaking edge points from live view picture. */
-    private fun analyze(bmp: android.graphics.Bitmap): Triple<Float, IntArray, FloatArray?> {
+    private fun analyze(bmp: Bitmap): Triple<Float, IntArray, FloatArray?> {
         val hist = IntArray(64)
         var sumLin = 0.0
         var n = 0
@@ -452,18 +462,18 @@ class MainActivity : AppCompatActivity() {
         while (y < bmp.height - 1) {
             var x = 1
             while (x < bmp.width - 1) {
-                val c = bmp.getPixel(x, y)
+                val c = bmp[x, y]
                 val l = 0.2126 * ((c shr 16) and 255) + 0.7152 * ((c shr 8) and 255) + 0.0722 * (c and 255)
                 hist[(l / 4).toInt().coerceAtMost(63)]++
-                sumLin += Math.pow(l / 255.0, 2.2)
+                sumLin += (l / 255.0).pow(2.2)
                 n++
 
                 if (hud.enableFocusPeaking) {
-                    val cRight = bmp.getPixel(x + 1, y)
+                    val cRight = bmp[x + 1, y]
                     val lRight = 0.2126 * ((cRight shr 16) and 255) + 0.7152 * ((cRight shr 8) and 255) + 0.0722 * (cRight and 255)
-                    val cDown = bmp.getPixel(x, y + 1)
+                    val cDown = bmp[x, y + 1]
                     val lDown = 0.2126 * ((cDown shr 16) and 255) + 0.7152 * ((cDown shr 8) and 255) + 0.0722 * (cDown and 255)
-                    val diff = Math.abs(l - lRight) + Math.abs(l - lDown)
+                    val diff = abs(l - lRight) + abs(l - lDown)
                     if (diff > 45) {
                         edgePoints.add(x.toFloat())
                         edgePoints.add(y.toFloat())
@@ -474,7 +484,7 @@ class MainActivity : AppCompatActivity() {
             y += step
         }
         val mean = (sumLin / n).coerceAtLeast(1e-6)
-        val ev = (Math.log(mean / 0.18) / Math.log(2.0)).toFloat().coerceIn(-3f, 3f)
+        val ev = log2(mean / 0.18).toFloat().coerceIn(-3f, 3f)
         val ptsArray = if (edgePoints.isNotEmpty()) edgePoints.toFloatArray() else null
         return Triple(ev, hist, ptsArray)
     }
@@ -501,7 +511,8 @@ class MainActivity : AppCompatActivity() {
             if (conn == null) { setStatus("openDevice failed"); running = false; return@Thread }
             var cs: CanonSession? = null
             try {
-                val iface = (0 until dev.interfaceCount).map { dev.getInterface(it) }
+                val iface = (0 until dev.interfaceCount).asSequence()
+                    .map { dev.getInterface(it) }
                     .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_STILL_IMAGE }
                     ?: throw PtpException("no PTP interface")
                 if (!conn.claimInterface(iface, true)) throw PtpException("claimInterface failed")
@@ -538,14 +549,14 @@ class MainActivity : AppCompatActivity() {
                         Thread.sleep(50); continue
                     }
                     val bmp = BitmapFactory.decodeByteArray(jpg, 0, jpg.size) ?: continue
-                    val stats = analyze(bmp)
+                    val (estEv, hist, focusPoints) = analyze(bmp)
                     runOnUiThread {
                         image.setImageBitmap(bmp)
                         hud.picW = bmp.width
                         hud.picH = bmp.height
-                        hud.estEv = stats.first
-                        hud.hist = stats.second
-                        hud.focusPoints = stats.third
+                        hud.estEv = estEv
+                        hud.hist = hist
+                        hud.focusPoints = focusPoints
                         hud.invalidate()
                         intervalBtn.text = if (cs.intervalRunning) "STOP" else "INTERVAL"
                     }

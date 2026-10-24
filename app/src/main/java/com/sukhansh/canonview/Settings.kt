@@ -1,5 +1,8 @@
 package com.sukhansh.canonview
 
+import kotlin.math.abs
+import kotlin.math.round
+
 /** Camera settings we show/change. Code tables are from libgphoto2 (config.c). */
 object Settings {
     class Prop(
@@ -23,7 +26,7 @@ object Settings {
         0x003b to "9", 0x003c to "9.5", 0x003d to "10", 0x0040 to "11", 0x0044 to "13",
         0x0045 to "14", 0x0048 to "16", 0x004b to "18", 0x004c to "19", 0x004d to "20",
         0x0050 to "22", 0x0053 to "25", 0x0054 to "27", 0x0055 to "29", 0x0058 to "32",
-    ).mapValues { "f/" + it.value }
+    ).mapValues { (_, value) -> "f/$value" }
 
     private val shutter = mapOf(
         0x0004 to "Bulb", 0x0010 to "30\"", 0x0013 to "25\"", 0x0015 to "20\"", 0x0018 to "15\"",
@@ -53,15 +56,17 @@ object Settings {
     val WB = Prop(0xD109, "WB", 0xFF, wb)
 
     // ---- read-only info shown on the HUD ----
-    val AE_MODE = Prop(0xD105, "Mode", 0xFFFF, mapOf(
-        0 to "P", 1 to "Tv", 2 to "Av", 3 to "M", 4 to "Bulb", 5 to "A-DEP", 6 to "DEP", 7 to "C",
-        9 to "Auto", 10 to "Night Portrait", 11 to "Sports", 12 to "Portrait", 13 to "Landscape",
-        14 to "Close-up", 15 to "Flash Off", 19 to "CA", 20 to "Movie",
-    ))
+    val AE_MODE = Prop(
+        0xD105, "Mode", 0xFFFF, mapOf(
+            0 to "P", 1 to "Tv", 2 to "Av", 3 to "M", 4 to "Bulb", 5 to "A-DEP", 6 to "DEP", 7 to "C",
+            9 to "Auto", 10 to "Night Portrait", 11 to "Sports", 12 to "Portrait", 13 to "Landscape",
+            14 to "Close-up", 15 to "Flash Off", 19 to "CA", 20 to "Movie",
+        )
+    )
     val EXP_COMP = Prop(0xD104, "Exp comp", 0xFF, emptyMap()) { v ->
         // signed, 1/8 EV units; shown to the nearest 1/3 stop
-        val t = Math.round((v.toByte().toInt() / 8f) * 3f) / 3f
-        if (Math.abs(t) < 0.05f) "0" else "%+.1f".format(t)
+        val t = round((v.toByte().toInt() / 8f) * 3f) / 3f
+        if (abs(t) < 0.05f) "0" else "%+.1f".format(t)
     }
     val DRIVE = Prop(0xD106, "Drive", 0xFFFF, mapOf(
         0 to "Single", 1 to "Continuous", 2 to "Video", 4 to "Cont. high", 5 to "Cont. low",

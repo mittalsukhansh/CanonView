@@ -5,6 +5,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.math.round
 
 /**
  * Canon EOS PTP extension: remote mode, live view, settings read/write,
@@ -104,7 +105,7 @@ class CanonSession(private val ptp: PtpUsb) {
     private fun setPropRetry(prop: Int, value: Int): PtpResult {
         var r = setProp(prop, value)
         var tries = 0
-        while (r.code == RC_DEVICE_BUSY && tries < 10) {
+        while ((r.code == RC_DEVICE_BUSY) && (tries < 10)) {
             Thread.sleep(300)
             pollEvents()
             r = setProp(prop, value)
@@ -175,8 +176,7 @@ class CanonSession(private val ptp: PtpUsb) {
                     intervalInfo = ""
                 }
                 is Action.Bracket -> {
-                    val bErr = doBracket(a.frames, a.stepThirds)
-                    if (bErr != null) err = bErr
+                    doBracket(a.frames, a.stepThirds)?.let { err = it }
                 }
             }
         }
@@ -190,7 +190,6 @@ class CanonSession(private val ptp: PtpUsb) {
         val now = System.currentTimeMillis()
         if (now < nextIntervalAt) return null
 
-        val shotStart = now
         intervalShotIndex++
         intervalInfo = if (intervalTargetCount > 0) "Interval $intervalShotIndex/$intervalTargetCount" else "Interval $intervalShotIndex/inf"
 
@@ -201,11 +200,11 @@ class CanonSession(private val ptp: PtpUsb) {
             return err
         }
 
-        if (intervalTargetCount > 0 && intervalShotIndex >= intervalTargetCount) {
+        if (intervalTargetCount in 1..intervalShotIndex) {
             intervalRunning = false
             intervalInfo = ""
         } else {
-            nextIntervalAt = shotStart + (intervalSeconds * 1000L)
+            nextIntervalAt = now + (intervalSeconds * 1000L)
         }
         return null
     }
@@ -223,7 +222,7 @@ class CanonSession(private val ptp: PtpUsb) {
             try {
                 val halfF = frames / 2
                 for (k in -halfF..halfF) {
-                    val offset8th = Math.round(k * stepThirds * 8f / 3f)
+                    val offset8th = round(k * stepThirds * 8f / 3f).toInt()
                     val targetCode = baseCode - offset8th
                     val snappedCode = shutterOpts.minByOrNull { Math.abs(it - targetCode) } ?: targetCode
                     setPropRetry(Settings.SHUTTER.id, snappedCode)
@@ -245,7 +244,7 @@ class CanonSession(private val ptp: PtpUsb) {
             try {
                 val halfF = frames / 2
                 for (k in -halfF..halfF) {
-                    val offset8th = Math.round(k * stepThirds * 8f / 3f)
+                    val offset8th = round(k * stepThirds * 8f / 3f).toInt()
                     val targetSigned = baseSigned + offset8th
                     val snappedCode = expOpts.minByOrNull { Math.abs(it.toByte().toInt() - targetSigned) } ?: baseCode
                     setPropRetry(Settings.EXP_COMP.id, snappedCode)
