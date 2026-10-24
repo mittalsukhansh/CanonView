@@ -7,6 +7,12 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.round
 
+data class IntervalPlan(
+    val startDelayMs: Long,
+    val intervalMs: Long,
+    val count: Int
+)
+
 /**
  * Canon EOS PTP extension: remote mode, live view, settings read/write,
  * drive lens stepping, live view zoom, intervalometer, bracketing, and photo release callback.
@@ -60,11 +66,20 @@ class CanonSession(private val ptp: PtpUsb) {
 
     /** Intervalometer status. */
     @Volatile var intervalRunning = false
+    @Volatile var intervalPaused = false
     @Volatile var intervalInfo = ""
-    private var intervalSeconds = 10
-    private var intervalTargetCount = 0
-    private var intervalShotIndex = 0
-    private var nextIntervalAt = 0L
+    @Volatile var intervalSummaryAtEnd = ""
+
+    private var currentPlan: IntervalPlan? = null
+    private var startAt = 0L
+    private var nextAt = 0L
+    private var pauseStartedAt = 0L
+    private var remainingTimeBeforePause = 0L
+    private var doneShots = 0
+    private var lateShots = 0
+    private var failedFrames = 0
+    private var consecutiveFailures = 0
+    private var intervalStartTimeMs = 0L
 
     /** Debug log ring buffer (last 25 entries). */
     val debugLogs = ConcurrentLinkedQueue<String>()
@@ -88,7 +103,9 @@ class CanonSession(private val ptp: PtpUsb) {
         class Zoom(val level: Int) : Action()
         object Shoot : Action()
         object Flash : Action()
-        class StartInterval(val seconds: Int, val count: Int) : Action()
+        class StartInterval(val plan: IntervalPlan) : Action()
+        object PauseInterval : Action()
+        object ResumeInterval : Action()
         object StopInterval : Action()
         class Bracket(val frames: Int, val stepThirds: Int) : Action()
     }
@@ -106,7 +123,9 @@ class CanonSession(private val ptp: PtpUsb) {
     fun requestZoom(level: Int) { pending.add(Action.Zoom(level)) }
     fun requestShoot() { pending.add(Action.Shoot) }
     fun requestFlash() { pending.add(Action.Flash) }
-    fun requestStartInterval(seconds: Int, count: Int) { pending.add(Action.StartInterval(seconds, count)) }
+    fun requestStartInterval(plan: IntervalPlan) { pending.add(Action.StartInterval(plan)) }
+    fun requestPauseInterval() { pending.add(Action.PauseInterval) }
+    fun requestResumeInterval() { pending.add(Action.ResumeInterval) }
     fun requestStopInterval() { pending.add(Action.StopInterval) }
     fun requestBracket(frames: Int, stepThirds: Int) { pending.add(Action.Bracket(frames, stepThirds)) }
 
@@ -284,17 +303,40 @@ class CanonSession(private val ptp: PtpUsb) {
                     if (r.code != RC_OK) err = "Flash failed: 0x${r.code.toString(16)} (use P/Av/Tv/M mode)"
                 }
                 is Action.StartInterval -> {
+                    currentPlan = a.plan
                     intervalRunning = true
-                    intervalSeconds = a.seconds
-                    intervalTargetCount = a.count
-                    intervalShotIndex = 0
-                    nextIntervalAt = System.currentTimeMillis()
-                    dbg("StartInterval sec=${a.seconds} count=${a.count}")
+                    intervalPaused = false
+                    intervalSummaryAtEnd = ""
+                    doneShots = 0
+                    lateShots = 0
+                    failedFrames = 0
+                    consecutiveFailures = 0
+                    intervalStartTimeMs = System.currentTimeMillis()
+                    startAt = intervalStartTimeMs + a.plan.startDelayMs
+                    nextAt = startAt
+                    dbg("StartInterval plan: delayMs=${a.plan.startDelayMs} intervalMs=${a.plan.intervalMs} count=${a.plan.count}")
+                }
+                Action.PauseInterval -> {
+                    if (intervalRunning && !intervalPaused) {
+                        intervalPaused = true
+                        pauseStartedAt = System.currentTimeMillis()
+                        remainingTimeBeforePause = (nextAt - pauseStartedAt).coerceAtLeast(0L)
+                        dbg("PauseInterval: remainingTimeBeforePause=${remainingTimeBeforePause}ms")
+                    }
+                }
+                Action.ResumeInterval -> {
+                    if (intervalRunning && intervalPaused) {
+                        intervalPaused = false
+                        nextAt = System.currentTimeMillis() + remainingTimeBeforePause
+                        dbg("ResumeInterval: nextAt in ${remainingTimeBeforePause}ms")
+                    }
                 }
                 Action.StopInterval -> {
                     intervalRunning = false
+                    intervalPaused = false
                     intervalInfo = ""
-                    dbg("StopInterval")
+                    currentPlan = null
+                    dbg("StopInterval requested")
                 }
                 is Action.Bracket -> {
                     doBracket(a.frames, a.stepThirds)?.let { err = it }
@@ -306,31 +348,130 @@ class CanonSession(private val ptp: PtpUsb) {
         return err
     }
 
+    private fun formatHms(seconds: Long): String {
+        val h = seconds / 3600
+        val m = (seconds % 3600) / 60
+        val s = seconds % 60
+        return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
+    }
+
     private fun tickInterval(): String? {
         if (!intervalRunning) return null
+        val plan = currentPlan ?: run { intervalRunning = false; return null }
         val now = System.currentTimeMillis()
-        if (now < nextIntervalAt) return null
 
-        intervalShotIndex++
-        intervalInfo = if (intervalTargetCount > 0) "Interval $intervalShotIndex/$intervalTargetCount" else "Interval $intervalShotIndex/inf"
-        dbg("Interval shot $intervalShotIndex starting...")
+        val shotsLeftCam = values[Settings.SHOTS.id] ?: -1
+        val battVal = values[Settings.BATTERY.id] ?: -1
+        val totalCountStr = if (plan.count > 0) plan.count.toString() else "inf"
 
-        val err = shoot(af = false)
+        if (intervalPaused) {
+            intervalInfo = "PAUSED  ·  Shot $doneShots/$totalCountStr"
+            return null
+        }
+
+        // Safety stops checked before each frame
+        if (noCard) {
+            intervalRunning = false
+            intervalInfo = ""
+            dbg("Interval stopped: No memory card")
+            return "No memory card"
+        }
+        if (shotsLeftCam == 0) {
+            intervalRunning = false
+            intervalInfo = ""
+            dbg("Interval stopped: Card full")
+            return "Card full"
+        }
+        if (battVal == 0) {
+            intervalRunning = false
+            intervalInfo = ""
+            dbg("Interval stopped: Battery low")
+            return "Battery low"
+        }
+
+        if (now < startAt) {
+            val startInSec = ((startAt - now + 999) / 1000).coerceAtLeast(1)
+            intervalInfo = "Starts in $startInSec s"
+            return null
+        }
+
+        if (now < nextAt) {
+            val nextInSec = ((nextAt - now + 999) / 1000).coerceAtLeast(0)
+            val remShots = if (plan.count > 0) (plan.count - doneShots).coerceAtLeast(0) else 0
+            val remSec = if (plan.count > 0) (remShots * (plan.intervalMs / 1000)) else 0L
+            val leftHms = if (plan.count > 0) formatHms(remSec) else "inf"
+            val battLabel = Settings.label(Settings.BATTERY, battVal)
+            val camLeftStr = if (shotsLeftCam >= 0) "$shotsLeftCam left" else "? left"
+
+            intervalInfo = "Shot $doneShots/$totalCountStr  ·  next in ${nextInSec}s  ·  left $leftHms  ·  camera $camLeftStr  ·  batt $battLabel"
+            return null
+        }
+
+        // Spacing is start-to-start
+        val t0 = System.currentTimeMillis()
+        nextAt = t0 + plan.intervalMs
+        doneShots++
+        dbg("Interval shot $doneShots/$totalCountStr starting...")
+
+        var err = shoot(af = false)
         if (err != null) {
-            intervalRunning = false
-            intervalInfo = ""
-            dbg("Interval stopped due to error: $err")
-            return err
+            var retryOk = false
+            for (rTry in 1..3) {
+                Thread.sleep(1000)
+                pollEvents()
+                dbg("Interval shot retry $rTry/3...")
+                val rErr = shoot(af = false)
+                if (rErr == null) {
+                    retryOk = true
+                    err = null
+                    break
+                } else {
+                    err = rErr
+                }
+            }
+            if (!retryOk) {
+                failedFrames++
+                consecutiveFailures++
+                dbg("Interval shot $doneShots failed 3 retries: $err")
+                if (consecutiveFailures >= 3) {
+                    intervalRunning = false
+                    intervalInfo = ""
+                    val msg = "Interval stopped: 3 consecutive failed shots ($err)"
+                    dbg(msg)
+                    return msg
+                }
+            } else {
+                consecutiveFailures = 0
+            }
+        } else {
+            consecutiveFailures = 0
         }
 
-        if (intervalTargetCount in 1..intervalShotIndex) {
+        val shotDuration = System.currentTimeMillis() - t0
+        if (shotDuration > plan.intervalMs) {
+            nextAt = System.currentTimeMillis()
+            lateShots++
+            dbg("Interval shot $doneShots took $shotDuration ms (> interval ${plan.intervalMs} ms), marked late")
+        }
+
+        if (plan.count > 0 && doneShots >= plan.count) {
+            val totalElapsedSec = (System.currentTimeMillis() - intervalStartTimeMs) / 1000
+            intervalSummaryAtEnd = "Done: $doneShots shots in ${formatHms(totalElapsedSec)}, $lateShots late, $failedFrames error"
             intervalRunning = false
             intervalInfo = ""
-            dbg("Interval finished target count reached")
+            dbg("Interval finished: $intervalSummaryAtEnd")
         } else {
-            nextIntervalAt = now + (intervalSeconds * 1000L)
+            val nextInSec = ((nextAt - System.currentTimeMillis() + 999) / 1000).coerceAtLeast(0)
+            val remShots = if (plan.count > 0) (plan.count - doneShots).coerceAtLeast(0) else 0
+            val remSec = if (plan.count > 0) (remShots * (plan.intervalMs / 1000)) else 0L
+            val leftHms = if (plan.count > 0) formatHms(remSec) else "inf"
+            val battLabel = Settings.label(Settings.BATTERY, battVal)
+            val camLeftStr = if (shotsLeftCam >= 0) "$shotsLeftCam left" else "? left"
+
+            intervalInfo = "Shot $doneShots/$totalCountStr  ·  next in ${nextInSec}s  ·  left $leftHms  ·  camera $camLeftStr  ·  batt $battLabel"
         }
-        return null
+
+        return err
     }
 
     private fun doBracket(frames: Int, stepThirds: Int): String? {

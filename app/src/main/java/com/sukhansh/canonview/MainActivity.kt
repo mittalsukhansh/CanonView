@@ -19,7 +19,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -36,10 +38,14 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.get
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.log2
 import kotlin.math.pow
@@ -295,10 +301,20 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this@MainActivity, "Camera not connected", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
-                if (s.intervalRunning) {
-                    s.requestStopInterval()
-                } else {
+                if (!s.intervalRunning) {
                     showIntervalDialog(s)
+                } else {
+                    val options = if (s.intervalPaused) arrayOf("Resume", "Stop") else arrayOf("Pause", "Stop")
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Intervalometer")
+                        .setItems(options) { _, which ->
+                            if (s.intervalPaused) {
+                                if (which == 0) s.requestResumeInterval() else s.requestStopInterval()
+                            } else {
+                                if (which == 0) s.requestPauseInterval() else s.requestStopInterval()
+                            }
+                        }
+                        .show()
                 }
             }
         }
@@ -469,37 +485,179 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showIntervalDialog(s: CanonSession) {
+        val prefs = getSharedPreferences("CanonViewPrefs", MODE_PRIVATE)
         val density = resources.displayMetrics.density
         val padPx = (16 * density).toInt()
+
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(padPx, padPx / 2, padPx, padPx / 2)
         }
+
+        val delayInput = EditText(this).apply {
+            hint = "Start delay in seconds (default 0)"
+            setText(prefs.getInt("interval_delay", 0).toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
         val intervalInput = EditText(this).apply {
             hint = "Interval in seconds (default 10)"
-            setText("10")
+            setText(prefs.getInt("interval_sec", 10).toString())
             inputType = InputType.TYPE_CLASS_NUMBER
         }
-        val countInput = EditText(this).apply {
-            hint = "Shots count (0 = infinite)"
-            setText("0")
+        val shotsInput = EditText(this).apply {
+            hint = "Shots count (0 = until stopped)"
+            setText(prefs.getInt("interval_shots", 0).toString())
             inputType = InputType.TYPE_CLASS_NUMBER
         }
+        val clipLenInput = EditText(this).apply {
+            hint = "Clip length in seconds (optional)"
+            setText(prefs.getInt("interval_clip_len", 0).toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val fpsInput = EditText(this).apply {
+            hint = "FPS (24 / 25 / 30)"
+            setText(prefs.getInt("interval_fps", 24).toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+
+        val summaryText = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(0, padPx / 2, 0, padPx / 4)
+        }
+
+        val warningText = TextView(this).apply {
+            setTextColor(Color.RED)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(0, 0, 0, padPx / 2)
+        }
+
+        layout.addView(TextView(this).apply { text = "Start delay (seconds):" })
+        layout.addView(delayInput)
         layout.addView(TextView(this).apply { text = "Interval (seconds):" })
         layout.addView(intervalInput)
-        layout.addView(TextView(this).apply { text = "Number of shots (0 = continuous):" })
-        layout.addView(countInput)
+        layout.addView(TextView(this).apply { text = "Number of shots (0 = until stopped):" })
+        layout.addView(shotsInput)
+        layout.addView(TextView(this).apply { text = "Planner - Clip length (seconds, optional):" })
+        layout.addView(clipLenInput)
+        layout.addView(TextView(this).apply { text = "Planner - Clip FPS (24 / 25 / 30):" })
+        layout.addView(fpsInput)
+        layout.addView(summaryText)
+        layout.addView(warningText)
 
-        AlertDialog.Builder(this)
+        var dialog: AlertDialog? = null
+        var isUpdatingText = false
+
+        fun updateSummaryAndWarnings() {
+            if (isUpdatingText) return
+            val delaySec = delayInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+            val intervalSec = intervalInput.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: 10
+            var shotsVal = shotsInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+            val clipSec = clipLenInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+            var fpsVal = fpsInput.text.toString().toIntOrNull() ?: 24
+            if (fpsVal !in listOf(24, 25, 30)) fpsVal = 24
+
+            if (clipSec > 0) {
+                val autoShots = clipSec * fpsVal
+                if (shotsVal != autoShots) {
+                    shotsVal = autoShots
+                    isUpdatingText = true
+                    shotsInput.setText(autoShots.toString())
+                    isUpdatingText = false
+                }
+            }
+
+            val shutterCode = s.values[Settings.SHUTTER.id] ?: 0x68
+            val exposureSec = if (shutterCode <= 0x04) 0.0 else (1.0 / 60.0) * Math.pow(2.0, (0x68 - shutterCode) / 8.0)
+            val minInterval = Math.ceil(exposureSec + 3.0).toInt()
+
+            val shootTimeSec = delaySec + if (shotsVal > 0) (shotsVal - 1) * intervalSec + exposureSec.toInt() else 0
+            val clipLenSec = if (fpsVal > 0 && shotsVal > 0) shotsVal / fpsVal else 0
+            val finishTimeMs = System.currentTimeMillis() + shootTimeSec * 1000L
+            val finishFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(finishTimeMs))
+
+            val shotsLeftCam = s.values[Settings.SHOTS.id] ?: -1
+            val battVal = s.values[Settings.BATTERY.id] ?: -1
+            val battLabel = Settings.label(Settings.BATTERY, battVal)
+            val camLeftStr = if (shotsLeftCam >= 0) "$shotsLeftCam" else "?"
+
+            fun fmtHms(sec: Long): String {
+                val h = sec / 3600
+                val m = (sec % 3600) / 60
+                val sc = sec % 60
+                return if (h > 0) "%d:%02d:%02d".format(h, m, sc) else "%d:%02d".format(m, sc)
+            }
+
+            val summary = "$shotsVal shots -> ${clipLenSec}s clip @ ${fpsVal}fps | shooting time ${fmtHms(shootTimeSec.toLong())} | finishes ~$finishFormat | camera has $camLeftStr shots left | battery $battLabel"
+            summaryText.text = summary
+
+            val warnings = ArrayList<String>()
+            var blocking = false
+
+            if (intervalSec < minInterval) {
+                warnings.add("Interval too short for this shutter speed (min ${minInterval}s)")
+                blocking = true
+            }
+            if (shotsLeftCam > 0 && shotsVal > shotsLeftCam) {
+                warnings.add("Card has room for only $shotsLeftCam shots")
+                blocking = true
+            }
+            if (s.values[Settings.AE_MODE.id] != 3) {
+                warnings.add("Use M mode: Av/P exposure can flicker")
+            }
+            if (exposureSec >= 1.0) {
+                warnings.add("Turn off Long exposure noise reduction in the camera menu")
+            }
+            if (battVal == 0) {
+                warnings.add("Battery low")
+            }
+
+            warningText.text = warnings.joinToString("\n")
+            dialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = !blocking
+        }
+
+        val watcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                updateSummaryAndWarnings()
+            }
+        }
+
+        delayInput.addTextChangedListener(watcher)
+        intervalInput.addTextChangedListener(watcher)
+        shotsInput.addTextChangedListener(watcher)
+        clipLenInput.addTextChangedListener(watcher)
+        fpsInput.addTextChangedListener(watcher)
+
+        dialog = AlertDialog.Builder(this)
             .setTitle("Intervalometer")
             .setView(layout)
             .setPositiveButton("Start") { _, _ ->
-                val sec = intervalInput.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: 10
-                val cnt = countInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
-                s.requestStartInterval(sec, cnt)
+                val delaySec = delayInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+                val intervalSec = intervalInput.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: 10
+                val shotsVal = shotsInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+                val clipSec = clipLenInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+                var fpsVal = fpsInput.text.toString().toIntOrNull() ?: 24
+                if (fpsVal !in listOf(24, 25, 30)) fpsVal = 24
+
+                prefs.edit()
+                    .putInt("interval_delay", delaySec)
+                    .putInt("interval_sec", intervalSec)
+                    .putInt("interval_shots", shotsVal)
+                    .putInt("interval_clip_len", clipSec)
+                    .putInt("interval_fps", fpsVal)
+                    .apply()
+
+                s.requestStartInterval(IntervalPlan(delaySec * 1000L, intervalSec * 1000L, shotsVal))
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .create()
+
+        dialog.setOnShowListener {
+            updateSummaryAndWarnings()
+        }
+        dialog.show()
     }
 
     private fun showBracketDialog(s: CanonSession) {
@@ -765,7 +923,11 @@ class MainActivity : AppCompatActivity() {
                         hud.hist = hist
                         hud.focusPoints = focusPoints
                         hud.invalidate()
-                        intervalBtn.text = if (cs.intervalRunning) "STOP" else "INTERVAL"
+                        intervalBtn.text = when {
+                            cs.intervalPaused -> "PAUSED"
+                            cs.intervalRunning -> "STOP"
+                            else -> "INTERVAL"
+                        }
                         if (showLogOverlay) {
                             logOverlay.text = cs.debugLogs.joinToString("\n")
                         }
@@ -773,7 +935,9 @@ class MainActivity : AppCompatActivity() {
                     frames++
                     val now = System.currentTimeMillis()
                     if (now - t0 >= 1000) {
-                        val intervalStr = if (cs.intervalInfo.isNotEmpty()) "  ·  ${cs.intervalInfo}" else ""
+                        val intervalStr = if (cs.intervalInfo.isNotEmpty()) "  ·  ${cs.intervalInfo}"
+                        else if (cs.intervalSummaryAtEnd.isNotEmpty()) "  ·  ${cs.intervalSummaryAtEnd}"
+                        else ""
                         setStatus("Live  $frames fps  ${bmp.width}x${bmp.height}$intervalStr")
                         frames = 0; t0 = now
                     }
