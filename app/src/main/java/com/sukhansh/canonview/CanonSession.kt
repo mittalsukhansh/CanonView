@@ -5,12 +5,18 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.math.abs
 import kotlin.math.round
 
 data class IntervalPlan(
     val startDelayMs: Long,
     val intervalMs: Long,
-    val count: Int
+    val endIntervalMs: Long = intervalMs,
+    val count: Int,
+    val shotsPerInterval: Int = 1,
+    val bracketStepThirds: Int = 1,
+    val totalEvRamp: Float = 0f,
+    val startTimeClock: String? = null
 )
 
 /**
@@ -80,6 +86,9 @@ class CanonSession(private val ptp: PtpUsb) {
     private var failedFrames = 0
     private var consecutiveFailures = 0
     private var intervalStartTimeMs = 0L
+    private var baseShutterCode = 0x68
+    private var baseIsoCode = 0x0048
+    private var evfTurnedOffBetweenShots = false
 
     /** Debug log ring buffer (last 25 entries). */
     val debugLogs = ConcurrentLinkedQueue<String>()
@@ -311,10 +320,13 @@ class CanonSession(private val ptp: PtpUsb) {
                     lateShots = 0
                     failedFrames = 0
                     consecutiveFailures = 0
+                    evfTurnedOffBetweenShots = false
                     intervalStartTimeMs = System.currentTimeMillis()
                     startAt = intervalStartTimeMs + a.plan.startDelayMs
                     nextAt = startAt
-                    dbg("StartInterval plan: delayMs=${a.plan.startDelayMs} intervalMs=${a.plan.intervalMs} count=${a.plan.count}")
+                    baseShutterCode = values[Settings.SHUTTER.id] ?: 0x68
+                    baseIsoCode = values[Settings.ISO.id] ?: 0x0048
+                    dbg("StartInterval plan: delayMs=${a.plan.startDelayMs} intervalMs=${a.plan.intervalMs} endIntervalMs=${a.plan.endIntervalMs} count=${a.plan.count} shotsPerInt=${a.plan.shotsPerInterval} evRamp=${a.plan.totalEvRamp}")
                 }
                 Action.PauseInterval -> {
                     if (intervalRunning && !intervalPaused) {
@@ -332,6 +344,11 @@ class CanonSession(private val ptp: PtpUsb) {
                     }
                 }
                 Action.StopInterval -> {
+                    if (evfTurnedOffBetweenShots) {
+                        setPropRetry(PROP_EVF_MODE, 1)
+                        setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
+                        evfTurnedOffBetweenShots = false
+                    }
                     intervalRunning = false
                     intervalPaused = false
                     intervalInfo = ""
@@ -353,6 +370,52 @@ class CanonSession(private val ptp: PtpUsb) {
         val m = (seconds % 3600) / 60
         val s = seconds % 60
         return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
+    }
+
+    private fun applyExposureRamp(plan: IntervalPlan, shotIdx: Int, currIntervalMs: Long) {
+        if (plan.count <= 1 || plan.totalEvRamp == 0f || values[Settings.AE_MODE.id] != 3) return
+        val progress = shotIdx.toFloat() / (plan.count - 1).toFloat()
+        val targetEighths = round(progress * (plan.totalEvRamp * 8f)).toInt()
+
+        val shutterOpts = options[Settings.SHUTTER.id] ?: emptyList()
+        val isoOpts = options[Settings.ISO.id] ?: emptyList()
+
+        var targetShutterCode = baseShutterCode
+        var targetIsoCode = baseIsoCode
+
+        if (targetEighths > 0) { // Brightening (sunset)
+            // Lengthen shutter first
+            val maxExpSec = (currIntervalMs / 1000.0) - 3.0
+            val desiredShutterCode = baseShutterCode - targetEighths
+            val bestShutter = shutterOpts.filter { code ->
+                val expSec = if (code <= 0x04) 0.0 else (1.0 / 60.0) * Math.pow(2.0, (0x68 - code) / 8.0)
+                expSec <= maxExpSec
+            }.minByOrNull { abs(it - desiredShutterCode) } ?: baseShutterCode
+
+            targetShutterCode = bestShutter
+            val shutterEighthsUsed = baseShutterCode - targetShutterCode
+            val remainingIsoEighths = targetEighths - shutterEighthsUsed
+            if (remainingIsoEighths > 0) {
+                val desiredIso = baseIsoCode + remainingIsoEighths
+                targetIsoCode = isoOpts.minByOrNull { abs(it - desiredIso) } ?: baseIsoCode
+            }
+        } else if (targetEighths < 0) { // Darkening (sunrise)
+            // Lower ISO first
+            val desiredIso = baseIsoCode + targetEighths
+            val minIsoOpt = isoOpts.minOrNull() ?: baseIsoCode
+            val bestIso = isoOpts.minByOrNull { abs(it - desiredIso) } ?: baseIsoCode
+            targetIsoCode = bestIso
+            val isoEighthsUsed = targetIsoCode - baseIsoCode
+            val remainingShutterEighths = targetEighths - isoEighthsUsed
+            if (remainingShutterEighths < 0) {
+                val desiredShutter = baseShutterCode - remainingShutterEighths
+                targetShutterCode = shutterOpts.minByOrNull { abs(it - desiredShutter) } ?: baseShutterCode
+            }
+        }
+
+        val rS = setPropRetry(Settings.SHUTTER.id, targetShutterCode)
+        val rI = setPropRetry(Settings.ISO.id, targetIsoCode)
+        dbg("ExposureRamp shot ${shotIdx + 1}/${plan.count}: targetEighths=$targetEighths shutter=0x${targetShutterCode.toString(16)} (res=0x${rS.code.toString(16)}) iso=0x${targetIsoCode.toString(16)} (res=0x${rI.code.toString(16)})")
     }
 
     private fun tickInterval(): String? {
@@ -395,10 +458,26 @@ class CanonSession(private val ptp: PtpUsb) {
             return null
         }
 
+        // Calculate current interval for interval ramp
+        val currIntervalMs = if (plan.count > 1 && plan.endIntervalMs != plan.intervalMs) {
+            val prog = (doneShots).toFloat() / (plan.count - 1).toFloat()
+            (plan.intervalMs + prog * (plan.endIntervalMs - plan.intervalMs)).toLong().coerceAtLeast(1000L)
+        } else {
+            plan.intervalMs
+        }
+
+        // Requirement e: Live View Off between shots for intervals >= 10s
+        if (currIntervalMs >= 10_000L && evfTurnedOffBetweenShots && (nextAt - now <= 2000L)) {
+            dbg("Interval: waking EVF 2s before next shot")
+            setPropRetry(PROP_EVF_MODE, 1)
+            setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
+            evfTurnedOffBetweenShots = false
+        }
+
         if (now < nextAt) {
             val nextInSec = ((nextAt - now + 999) / 1000).coerceAtLeast(0)
             val remShots = if (plan.count > 0) (plan.count - doneShots).coerceAtLeast(0) else 0
-            val remSec = if (plan.count > 0) (remShots * (plan.intervalMs / 1000)) else 0L
+            val remSec = if (plan.count > 0) (remShots * (currIntervalMs / 1000)) else 0L
             val leftHms = if (plan.count > 0) formatHms(remSec) else "inf"
             val battLabel = Settings.label(Settings.BATTERY, battVal)
             val camLeftStr = if (shotsLeftCam >= 0) "$shotsLeftCam left" else "? left"
@@ -409,18 +488,27 @@ class CanonSession(private val ptp: PtpUsb) {
 
         // Spacing is start-to-start
         val t0 = System.currentTimeMillis()
-        nextAt = t0 + plan.intervalMs
+        nextAt = t0 + currIntervalMs
         doneShots++
+
+        // Requirement c: Exposure ramp before shot
+        applyExposureRamp(plan, doneShots - 1, currIntervalMs)
+
         dbg("Interval shot $doneShots/$totalCountStr starting...")
 
-        var err = shoot(af = false)
+        var err: String? = if (plan.shotsPerInterval > 1) {
+            doBracket(plan.shotsPerInterval, plan.bracketStepThirds)
+        } else {
+            shoot(af = false)
+        }
+
         if (err != null) {
             var retryOk = false
             for (rTry in 1..3) {
                 Thread.sleep(1000)
                 pollEvents()
                 dbg("Interval shot retry $rTry/3...")
-                val rErr = shoot(af = false)
+                val rErr = if (plan.shotsPerInterval > 1) doBracket(plan.shotsPerInterval, plan.bracketStepThirds) else shoot(af = false)
                 if (rErr == null) {
                     retryOk = true
                     err = null
@@ -448,13 +536,25 @@ class CanonSession(private val ptp: PtpUsb) {
         }
 
         val shotDuration = System.currentTimeMillis() - t0
-        if (shotDuration > plan.intervalMs) {
+        if (shotDuration > currIntervalMs) {
             nextAt = System.currentTimeMillis()
             lateShots++
-            dbg("Interval shot $doneShots took $shotDuration ms (> interval ${plan.intervalMs} ms), marked late")
+            dbg("Interval shot $doneShots took $shotDuration ms (> interval $currIntervalMs ms), marked late")
+        }
+
+        // Requirement e: Turn off EVF between shots if interval >= 10s
+        if (currIntervalMs >= 10_000L && intervalRunning) {
+            dbg("Interval: turning EVF output off between shots")
+            setProp(PROP_EVF_OUTPUT_DEVICE, 0)
+            evfTurnedOffBetweenShots = true
         }
 
         if (plan.count > 0 && doneShots >= plan.count) {
+            if (evfTurnedOffBetweenShots) {
+                setPropRetry(PROP_EVF_MODE, 1)
+                setPropRetry(PROP_EVF_OUTPUT_DEVICE, 2)
+                evfTurnedOffBetweenShots = false
+            }
             val totalElapsedSec = (System.currentTimeMillis() - intervalStartTimeMs) / 1000
             intervalSummaryAtEnd = "Done: $doneShots shots in ${formatHms(totalElapsedSec)}, $lateShots late, $failedFrames error"
             intervalRunning = false
@@ -463,7 +563,7 @@ class CanonSession(private val ptp: PtpUsb) {
         } else {
             val nextInSec = ((nextAt - System.currentTimeMillis() + 999) / 1000).coerceAtLeast(0)
             val remShots = if (plan.count > 0) (plan.count - doneShots).coerceAtLeast(0) else 0
-            val remSec = if (plan.count > 0) (remShots * (plan.intervalMs / 1000)) else 0L
+            val remSec = if (plan.count > 0) (remShots * (currIntervalMs / 1000)) else 0L
             val leftHms = if (plan.count > 0) formatHms(remSec) else "inf"
             val battLabel = Settings.label(Settings.BATTERY, battVal)
             val camLeftStr = if (shotsLeftCam >= 0) "$shotsLeftCam left" else "? left"
@@ -490,7 +590,7 @@ class CanonSession(private val ptp: PtpUsb) {
                 for (k in -halfF..halfF) {
                     val offset8th = round(k * stepThirds * 8f / 3f).toInt()
                     val targetCode = baseCode - offset8th
-                    val snappedCode = shutterOpts.minByOrNull { Math.abs(it - targetCode) } ?: targetCode
+                    val snappedCode = shutterOpts.minByOrNull { abs(it - targetCode) } ?: targetCode
 
                     dbg("Bracket shutter step k=$k targetCode=$targetCode snappedCode=$snappedCode")
                     val rSet = setPropRetry(Settings.SHUTTER.id, snappedCode)
@@ -533,7 +633,7 @@ class CanonSession(private val ptp: PtpUsb) {
                 for (k in -halfF..halfF) {
                     val offset8th = round(k * stepThirds * 8f / 3f).toInt()
                     val targetSigned = baseSigned + offset8th
-                    val snappedCode = expOpts.minByOrNull { Math.abs(it.toByte().toInt() - targetSigned) } ?: baseCode
+                    val snappedCode = expOpts.minByOrNull { abs(it.toByte().toInt() - targetSigned) } ?: baseCode
 
                     dbg("Bracket expComp step k=$k targetSigned=$targetSigned snappedCode=$snappedCode")
                     val rSet = setPropRetry(Settings.EXP_COMP.id, snappedCode)

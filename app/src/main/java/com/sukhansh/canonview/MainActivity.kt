@@ -38,17 +38,18 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.core.graphics.get
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.log2
 import kotlin.math.pow
+import kotlin.math.round
 
 class MainActivity : AppCompatActivity() {
 
@@ -495,19 +496,32 @@ class MainActivity : AppCompatActivity() {
         }
 
         val delayInput = EditText(this).apply {
-            hint = "Start delay in seconds (default 0)"
-            setText(prefs.getInt("interval_delay", 0).toString())
-            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "Start delay (s) or Clock HH:MM"
+            setText(prefs.getString("interval_delay_str", "0"))
         }
         val intervalInput = EditText(this).apply {
-            hint = "Interval in seconds (default 10)"
+            hint = "Start interval in seconds (default 10)"
             setText(prefs.getInt("interval_sec", 10).toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val endIntervalInput = EditText(this).apply {
+            hint = "End interval in seconds (optional ramp)"
+            setText(prefs.getInt("interval_end_sec", 10).toString())
             inputType = InputType.TYPE_CLASS_NUMBER
         }
         val shotsInput = EditText(this).apply {
             hint = "Shots count (0 = until stopped)"
             setText(prefs.getInt("interval_shots", 0).toString())
             inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val shotsPerIntervalInput = EditText(this).apply {
+            hint = "Shots per interval (1, 3, 5)"
+            setText(prefs.getInt("interval_spi", 1).toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val evRampInput = EditText(this).apply {
+            hint = "Total EV Exposure Ramp (e.g. +6.0 for sunset, -4.0)"
+            setText(prefs.getFloat("interval_ev_ramp", 0f).toString())
         }
         val clipLenInput = EditText(this).apply {
             hint = "Clip length in seconds (optional)"
@@ -532,12 +546,22 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, padPx / 2)
         }
 
-        layout.addView(TextView(this).apply { text = "Start delay (seconds):" })
+        val scrollContainer = ScrollView(this).apply {
+            addView(layout)
+        }
+
+        layout.addView(TextView(this).apply { text = "Start delay (seconds) OR Clock HH:MM:" })
         layout.addView(delayInput)
-        layout.addView(TextView(this).apply { text = "Interval (seconds):" })
+        layout.addView(TextView(this).apply { text = "Start Interval (seconds):" })
         layout.addView(intervalInput)
+        layout.addView(TextView(this).apply { text = "End Interval (seconds, for ramp):" })
+        layout.addView(endIntervalInput)
         layout.addView(TextView(this).apply { text = "Number of shots (0 = until stopped):" })
         layout.addView(shotsInput)
+        layout.addView(TextView(this).apply { text = "Shots per interval (1, 3, 5):" })
+        layout.addView(shotsPerIntervalInput)
+        layout.addView(TextView(this).apply { text = "Total EV Exposure Ramp (+/- EV):" })
+        layout.addView(evRampInput)
         layout.addView(TextView(this).apply { text = "Planner - Clip length (seconds, optional):" })
         layout.addView(clipLenInput)
         layout.addView(TextView(this).apply { text = "Planner - Clip FPS (24 / 25 / 30):" })
@@ -548,11 +572,44 @@ class MainActivity : AppCompatActivity() {
         var dialog: AlertDialog? = null
         var isUpdatingText = false
 
+        fun parseDelayMs(inputStr: String): Pair<Long, String?> {
+            val trimmed = inputStr.trim()
+            if (trimmed.contains(":")) {
+                val parts = trimmed.split(":")
+                if (parts.size == 2) {
+                    val h = parts[0].toIntOrNull()
+                    val m = parts[1].toIntOrNull()
+                    if (h != null && m != null && h in 0..23 && m in 0..59) {
+                        val cal = Calendar.getInstance()
+                        cal.set(Calendar.HOUR_OF_DAY, h)
+                        cal.set(Calendar.MINUTE, m)
+                        cal.set(Calendar.SECOND, 0)
+                        cal.set(Calendar.MILLISECOND, 0)
+                        var targetMs = cal.timeInMillis
+                        val nowMs = System.currentTimeMillis()
+                        if (targetMs <= nowMs) {
+                            targetMs += 86_400_000L // Next day
+                        }
+                        return Pair(targetMs - nowMs, "%02d:%02d".format(h, m))
+                    }
+                }
+            }
+            val sec = trimmed.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+            return Pair(sec * 1000L, null)
+        }
+
         fun updateSummaryAndWarnings() {
             if (isUpdatingText) return
-            val delaySec = delayInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+            val delayStr = delayInput.text.toString()
+            val (delayMs, clockStr) = parseDelayMs(delayStr)
+            val delaySec = delayMs / 1000L
+
             val intervalSec = intervalInput.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: 10
+            val endIntervalSec = endIntervalInput.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: intervalSec
             var shotsVal = shotsInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+            val spiVal = shotsPerIntervalInput.text.toString().toIntOrNull()?.let { if (it in listOf(3, 5)) it else 1 } ?: 1
+            val totalEvRampVal = evRampInput.text.toString().toFloatOrNull() ?: 0f
+
             val clipSec = clipLenInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
             var fpsVal = fpsInput.text.toString().toIntOrNull() ?: 24
             if (fpsVal !in listOf(24, 25, 30)) fpsVal = 24
@@ -568,13 +625,58 @@ class MainActivity : AppCompatActivity() {
             }
 
             val shutterCode = s.values[Settings.SHUTTER.id] ?: 0x68
+            val baseIsoCode = s.values[Settings.ISO.id] ?: 0x0048
             val exposureSec = if (shutterCode <= 0x04) 0.0 else (1.0 / 60.0) * Math.pow(2.0, (0x68 - shutterCode) / 8.0)
             val minInterval = Math.ceil(exposureSec + 3.0).toInt()
 
-            val shootTimeSec = delaySec + if (shotsVal > 0) (shotsVal - 1) * intervalSec + exposureSec.toInt() else 0
-            val clipLenSec = if (fpsVal > 0 && shotsVal > 0) shotsVal / fpsVal else 0
+            val effectiveShots = if (shotsVal > 0) shotsVal else 0
+            val avgIntervalSec = (intervalSec + endIntervalSec) / 2.0
+            val shootTimeSec = delaySec + if (effectiveShots > 0) (effectiveShots - 1) * avgIntervalSec.toInt() + exposureSec.toInt() else 0
+            val clipLenSec = if (fpsVal > 0 && effectiveShots > 0) effectiveShots / fpsVal else 0
             val finishTimeMs = System.currentTimeMillis() + shootTimeSec * 1000L
             val finishFormat = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(finishTimeMs))
+
+            // Planned End Settings Calculation for Exposure Ramp
+            var endShutterStr = Settings.label(Settings.SHUTTER, shutterCode)
+            var endIsoStr = Settings.label(Settings.ISO, baseIsoCode)
+            if (effectiveShots > 1 && totalEvRampVal != 0f && s.values[Settings.AE_MODE.id] == 3) {
+                val targetEighths = round(totalEvRampVal * 8f).toInt()
+                val shutterOpts = s.options[Settings.SHUTTER.id] ?: emptyList()
+                val isoOpts = s.options[Settings.ISO.id] ?: emptyList()
+
+                var endSCode = shutterCode
+                var endICode = baseIsoCode
+
+                if (targetEighths > 0) { // Brightening
+                    val maxExpSec = (endIntervalSec.toDouble()) - 3.0
+                    val desiredShutterCode = shutterCode - targetEighths
+                    val bestShutter = shutterOpts.filter { code ->
+                        val expSec = if (code <= 0x04) 0.0 else (1.0 / 60.0) * Math.pow(2.0, (0x68 - code) / 8.0)
+                        expSec <= maxExpSec
+                    }.minByOrNull { abs(it - desiredShutterCode) } ?: shutterCode
+
+                    endSCode = bestShutter
+                    val shutterEighthsUsed = shutterCode - endSCode
+                    val remainingIsoEighths = targetEighths - shutterEighthsUsed
+                    if (remainingIsoEighths > 0) {
+                        val desiredIso = baseIsoCode + remainingIsoEighths
+                        endICode = isoOpts.minByOrNull { abs(it - desiredIso) } ?: baseIsoCode
+                    }
+                } else if (targetEighths < 0) { // Darkening
+                    val desiredIso = baseIsoCode + targetEighths
+                    val bestIso = isoOpts.minByOrNull { abs(it - desiredIso) } ?: baseIsoCode
+                    endICode = bestIso
+                    val isoEighthsUsed = endICode - baseIsoCode
+                    val remainingShutterEighths = targetEighths - isoEighthsUsed
+                    if (remainingShutterEighths < 0) {
+                        val desiredShutter = shutterCode - remainingShutterEighths
+                        endSCode = shutterOpts.minByOrNull { abs(it - desiredShutter) } ?: shutterCode
+                    }
+                }
+
+                endShutterStr = Settings.label(Settings.SHUTTER, endSCode)
+                endIsoStr = Settings.label(Settings.ISO, endICode)
+            }
 
             val shotsLeftCam = s.values[Settings.SHOTS.id] ?: -1
             val battVal = s.values[Settings.BATTERY.id] ?: -1
@@ -588,14 +690,18 @@ class MainActivity : AppCompatActivity() {
                 return if (h > 0) "%d:%02d:%02d".format(h, m, sc) else "%d:%02d".format(m, sc)
             }
 
-            val summary = "$shotsVal shots -> ${clipLenSec}s clip @ ${fpsVal}fps | shooting time ${fmtHms(shootTimeSec.toLong())} | finishes ~$finishFormat | camera has $camLeftStr shots left | battery $battLabel"
+            val rampStr = if (totalEvRampVal != 0f) " | end $endShutterStr ISO $endIsoStr" else ""
+            val clockStartStr = if (clockStr != null) " (start @ $clockStr)" else ""
+
+            val spiStr = if (spiVal > 1) " ($spiVal shots/int)" else ""
+            val summary = "$shotsVal shots$spiStr -> ${clipLenSec}s clip @ ${fpsVal}fps$clockStartStr | duration ${fmtHms(shootTimeSec)} | finishes ~$finishFormat$rampStr | camera $camLeftStr left | batt $battLabel"
             summaryText.text = summary
 
             val warnings = ArrayList<String>()
             var blocking = false
 
             if (intervalSec < minInterval) {
-                warnings.add("Interval too short for this shutter speed (min ${minInterval}s)")
+                warnings.add("Interval too short for shutter speed (min ${minInterval}s)")
                 blocking = true
             }
             if (shotsLeftCam > 0 && shotsVal > shotsLeftCam) {
@@ -606,7 +712,7 @@ class MainActivity : AppCompatActivity() {
                 warnings.add("Use M mode: Av/P exposure can flicker")
             }
             if (exposureSec >= 1.0) {
-                warnings.add("Turn off Long exposure noise reduction in the camera menu")
+                warnings.add("Turn off Long exposure noise reduction in camera menu")
             }
             if (battVal == 0) {
                 warnings.add("Battery low")
@@ -626,30 +732,51 @@ class MainActivity : AppCompatActivity() {
 
         delayInput.addTextChangedListener(watcher)
         intervalInput.addTextChangedListener(watcher)
+        endIntervalInput.addTextChangedListener(watcher)
         shotsInput.addTextChangedListener(watcher)
+        shotsPerIntervalInput.addTextChangedListener(watcher)
+        evRampInput.addTextChangedListener(watcher)
         clipLenInput.addTextChangedListener(watcher)
         fpsInput.addTextChangedListener(watcher)
 
         dialog = AlertDialog.Builder(this)
             .setTitle("Intervalometer")
-            .setView(layout)
+            .setView(scrollContainer)
             .setPositiveButton("Start") { _, _ ->
-                val delaySec = delayInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+                val delayStr = delayInput.text.toString()
+                val (delayMs, clockStr) = parseDelayMs(delayStr)
                 val intervalSec = intervalInput.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: 10
+                val endIntervalSec = endIntervalInput.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: intervalSec
                 val shotsVal = shotsInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
+                val spiVal = shotsPerIntervalInput.text.toString().toIntOrNull()?.let { if (it in listOf(3, 5)) it else 1 } ?: 1
+                val totalEvRampVal = evRampInput.text.toString().toFloatOrNull() ?: 0f
                 val clipSec = clipLenInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0
                 var fpsVal = fpsInput.text.toString().toIntOrNull() ?: 24
                 if (fpsVal !in listOf(24, 25, 30)) fpsVal = 24
 
                 prefs.edit()
-                    .putInt("interval_delay", delaySec)
+                    .putString("interval_delay_str", delayStr)
                     .putInt("interval_sec", intervalSec)
+                    .putInt("interval_end_sec", endIntervalSec)
                     .putInt("interval_shots", shotsVal)
+                    .putInt("interval_spi", spiVal)
+                    .putFloat("interval_ev_ramp", totalEvRampVal)
                     .putInt("interval_clip_len", clipSec)
                     .putInt("interval_fps", fpsVal)
                     .apply()
 
-                s.requestStartInterval(IntervalPlan(delaySec * 1000L, intervalSec * 1000L, shotsVal))
+                s.requestStartInterval(
+                    IntervalPlan(
+                        startDelayMs = delayMs,
+                        intervalMs = intervalSec * 1000L,
+                        endIntervalMs = endIntervalSec * 1000L,
+                        count = shotsVal,
+                        shotsPerInterval = spiVal,
+                        bracketStepThirds = 1,
+                        totalEvRamp = totalEvRampVal,
+                        startTimeClock = clockStr
+                    )
+                )
             }
             .setNegativeButton("Cancel", null)
             .create()
