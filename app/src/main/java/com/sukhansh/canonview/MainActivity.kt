@@ -446,6 +446,7 @@ class MainActivity : AppCompatActivity() {
             addView(sideScroll, sideScrollParams)
             addView(previewCard, FrameLayout.LayoutParams(previewWidthPx, previewHeightPx, Gravity.START or Gravity.CENTER_VERTICAL).apply {
                 marginStart = previewMarginStartPx
+                topMargin = (28 * density).toInt()
             })
             addView(fullPreviewOverlay, FrameLayout.LayoutParams(-1, -1))
         }

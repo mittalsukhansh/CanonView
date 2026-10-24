@@ -172,7 +172,7 @@ class HudView(ctx: Context) : View(ctx) {
 
         // ---- histogram ----
         hist?.let { hs ->
-            val hx = w - 108 * d
+            val hx = 12 * d
             val hy = topPad + 50 * d
             val hw = 96 * d
             val hh = 36 * d
