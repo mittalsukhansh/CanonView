@@ -42,12 +42,13 @@ class HudView(ctx: Context) : View(ctx) {
     var gridMode = 0
 
     private val d = ctx.resources.displayMetrics.density
-    private val topPad = 30 * d
+    private val topPad = 28 * d
     private val strip = Paint().apply { color = 0x99000000.toInt() }
     private val big = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE; textSize = 22 * d; typeface = Typeface.DEFAULT_BOLD
+        color = Color.WHITE; textSize = 16 * d; typeface = Typeface.DEFAULT_BOLD
     }
-    private val small = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFCCCCCC.toInt(); textSize = 13 * d }
+    private val small = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFCCCCCC.toInt(); textSize = 11 * d }
+    private val scaleNumPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFCCCCCC.toInt(); textSize = 10 * d }
     private val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 1.5f * d
     }
@@ -67,6 +68,7 @@ class HudView(ctx: Context) : View(ctx) {
     }
     private val histPaint = Paint().apply { color = 0xCCFFFFFF.toInt(); strokeWidth = 2f * d }
     private val tempModeRect = RectF()
+    private val tempTriPath = Path()
 
     override fun onDraw(c: Canvas) {
         val w = width.toFloat()
@@ -152,28 +154,28 @@ class HudView(ctx: Context) : View(ctx) {
         }
 
         // ---- top strip: mode, shutter, aperture, ISO | battery, shots ----
-        c.drawRect(0f, topPad, w, topPad + 62 * d, strip)
+        c.drawRect(0f, topPad, w, topPad + 44 * d, strip)
         var x = 12 * d
-        val y1 = topPad + 30 * d
-        val mw = big.measureText(mode) + 16 * d
-        tempModeRect.set(x, y1 - 24 * d, x + mw, y1 + 7 * d)
-        c.drawRoundRect(tempModeRect, 6 * d, 6 * d, outline)
-        c.drawText(mode, x + 8 * d, y1, big)
-        x += mw + 16 * d
+        val y1 = topPad + 20 * d
+        val mw = big.measureText(mode) + 12 * d
+        tempModeRect.set(x, y1 - 17 * d, x + mw, y1 + 5 * d)
+        c.drawRoundRect(tempModeRect, 4 * d, 4 * d, outline)
+        c.drawText(mode, x + 6 * d, y1, big)
+        x += mw + 14 * d
         for (s in listOf(shutter, aperture, "ISO $iso")) {
             c.drawText(s, x, y1, big)
-            x += big.measureText(s) + 20 * d
+            x += big.measureText(s) + 14 * d
         }
         val right = "$battery  [$shots]"
         c.drawText(right, w - 12 * d - small.measureText(right), y1, small)
-        c.drawText(extras, 12 * d, topPad + 54 * d, small)
+        c.drawText(extras, 12 * d, topPad + 38 * d, small)
 
         // ---- histogram ----
         hist?.let { hs ->
-            val hx = w - 140 * d
-            val hy = topPad + 68 * d
-            val hw = 128 * d
-            val hh = 48 * d
+            val hx = w - 108 * d
+            val hy = topPad + 50 * d
+            val hw = 96 * d
+            val hh = 36 * d
             c.drawRect(hx, hy, hx + hw, hy + hh, strip)
             val mx = (hs.maxOrNull() ?: 1).coerceAtLeast(1)
             val bw = hw / hs.size
@@ -186,17 +188,17 @@ class HudView(ctx: Context) : View(ctx) {
 
         // ---- exposure scale ----
         val cx = w / 2
-        val half = min(w * 0.30f, 240 * d)
-        val sy = h - 130 * d
-        c.drawRect(cx - half - 24 * d, sy - 34 * d, cx + half + 24 * d, sy + 62 * d, strip)
+        val half = min(w * 0.18f, 140 * d)
+        val sy = h - 108 * d
+        c.drawRect(cx - (half + 16 * d), sy - 22 * d, cx + (half + 16 * d), sy + 38 * d, strip)
         c.drawLine(cx - half, sy, cx + half, sy, tick)
         for (i in -9..9) {
             val px = cx + (i / 3f) / 3f * half
-            val len = if (i % 3 == 0) 12 * d else 6 * d
+            val len = if (i % 3 == 0) 7 * d else 4 * d
             c.drawLine(px, sy, px, sy + len, tick)
             if (i % 3 == 0) {
                 val t = if (i == 0) "0" else "%+d".format(i / 3)
-                c.drawText(t, px - small.measureText(t) / 2, sy + 30 * d, small)
+                c.drawText(t, px - scaleNumPaint.measureText(t) / 2, sy + 20 * d, scaleNumPaint)
             }
         }
         fun posOf(ev: Float) = cx + ev.coerceIn(-3f, 3f) / 3f * half
@@ -205,18 +207,20 @@ class HudView(ctx: Context) : View(ctx) {
             tag = "exposure (estimated from picture)"
             estEv?.let { ev ->
                 val p = posOf(ev)
-                c.drawRect(p - 3 * d, sy - 20 * d, p + 3 * d, sy - 3 * d, cyan)
+                c.drawRect(p - 2 * d, sy - 14 * d, p + 2 * d, sy - 2 * d, cyan)
             }
         } else {
             tag = "exposure compensation"
             compEv?.let { ev ->
                 val p = posOf(ev)
-                val tri = Path().apply {
-                    moveTo(p - 7 * d, sy - 20 * d); lineTo(p + 7 * d, sy - 20 * d); lineTo(p, sy - 4 * d); close()
-                }
-                c.drawPath(tri, yellow)
+                tempTriPath.reset()
+                tempTriPath.moveTo(p - 5 * d, sy - 14 * d)
+                tempTriPath.lineTo(p + 5 * d, sy - 14 * d)
+                tempTriPath.lineTo(p, sy - 3 * d)
+                tempTriPath.close()
+                c.drawPath(tempTriPath, yellow)
             }
         }
-        c.drawText(tag, cx - small.measureText(tag) / 2, sy + 52 * d, small)
+        c.drawText(tag, cx - small.measureText(tag) / 2, sy + 34 * d, small)
     }
 }

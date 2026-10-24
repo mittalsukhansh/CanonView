@@ -61,7 +61,13 @@ class MainActivity : AppCompatActivity() {
     // Photo Preview Overlay
     private lateinit var previewCard: FrameLayout
     private lateinit var previewImage: ImageView
+    private var lastPreviewBitmap: Bitmap? = null
     private var autoHidePreviewRunnable: Runnable? = null
+
+    // Full-Screen Photo Preview Overlay
+    private lateinit var fullPreviewOverlay: FrameLayout
+    private lateinit var fullPreviewImage: ImageView
+    private var autoHideFullPreviewRunnable: Runnable? = null
 
     // Debug Log Overlay
     private lateinit var logOverlay: TextView
@@ -114,6 +120,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun openFullPreviewOverlay() {
+        val bmp = lastPreviewBitmap ?: return
+        fullPreviewImage.setImageBitmap(bmp)
+        fullPreviewOverlay.visibility = View.VISIBLE
+
+        autoHidePreviewRunnable?.let { mainHandler.removeCallbacks(it) }
+        previewCard.visibility = View.GONE
+
+        autoHideFullPreviewRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable { closeFullPreviewOverlay() }
+        autoHideFullPreviewRunnable = runnable
+        mainHandler.postDelayed(runnable, 10_000L)
+    }
+
+    private fun closeFullPreviewOverlay() {
+        autoHideFullPreviewRunnable?.let { mainHandler.removeCallbacks(it) }
+        fullPreviewOverlay.visibility = View.GONE
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -130,6 +155,7 @@ class MainActivity : AppCompatActivity() {
         hud = HudView(this)
         status = TextView(this).apply {
             setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setPadding((12 * density).toInt(), (8 * density).toInt(), (12 * density).toInt(), (8 * density).toInt())
             setOnLongClickListener {
                 showLogOverlay = !showLogOverlay
@@ -381,6 +407,32 @@ class MainActivity : AppCompatActivity() {
             setPadding((8 * density).toInt(), (8 * density).toInt(), (8 * density).toInt(), (8 * density).toInt())
             addView(previewImage, FrameLayout.LayoutParams(-1, -1))
             addView(dismissBtn, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
+            setOnClickListener {
+                if (lastPreviewBitmap != null) {
+                    openFullPreviewOverlay()
+                }
+            }
+        }
+
+        // --- Full-Screen Photo Preview Overlay ---
+        fullPreviewImage = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setOnClickListener { closeFullPreviewOverlay() }
+        }
+        val fullCloseBtn = Button(this).apply {
+            text = "CLOSE"
+            setOnClickListener { closeFullPreviewOverlay() }
+        }
+        val fullCloseMarginPx = (16 * density).toInt()
+
+        fullPreviewOverlay = FrameLayout(this).apply {
+            setBackgroundColor(0xF0000000.toInt())
+            visibility = View.GONE
+            addView(fullPreviewImage, FrameLayout.LayoutParams(-1, -1))
+            addView(fullCloseBtn, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
+                topMargin = fullCloseMarginPx
+                marginEnd = fullCloseMarginPx
+            })
         }
 
         val rootLayout = FrameLayout(this).apply {
@@ -396,6 +448,7 @@ class MainActivity : AppCompatActivity() {
             addView(previewCard, FrameLayout.LayoutParams(previewWidthPx, previewHeightPx, Gravity.START or Gravity.CENTER_VERTICAL).apply {
                 marginStart = previewMarginStartPx
             })
+            addView(fullPreviewOverlay, FrameLayout.LayoutParams(-1, -1))
         }
 
         ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { _, insets ->
@@ -516,6 +569,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        closeFullPreviewOverlay()
+        autoHidePreviewRunnable?.let { mainHandler.removeCallbacks(it) }
         running = false
         worker?.join(2500)
         worker = null
@@ -626,7 +681,10 @@ class MainActivity : AppCompatActivity() {
                 cs.onPhotoCaptured = { photoBytes ->
                     val shotBmp = BitmapFactory.decodeByteArray(photoBytes, 0, photoBytes.size)
                     if (shotBmp != null) {
+                        lastPreviewBitmap = shotBmp
                         runOnUiThread {
+                            closeFullPreviewOverlay()
+
                             previewImage.setImageBitmap(shotBmp)
                             previewCard.visibility = View.VISIBLE
 
